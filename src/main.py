@@ -60,12 +60,22 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
             except Exception as e:  # noqa: BLE001
                 print(f"   ⚠️  板块 {row['板块名称']} 成分股获取失败: {e}")
 
-    # 与 spot 取交集（过滤掉 ST/小市值/北交所）
+    # 构建 spot_map + turnover_map
     name_col = "名称" if "名称" in spot.columns else spot.columns[1]
     spot_map = {str(r["代码"]).zfill(6): r[name_col] for _, r in spot.iterrows()}
+    turn_col = next((c for c in spot.columns if "换手" in c), None)
+    turnover_map: dict[str, float] = {}
+    if turn_col:
+        for _, r in spot.iterrows():
+            code = str(r["代码"]).zfill(6)
+            try:
+                turnover_map[code] = float(r[turn_col])
+            except (ValueError, TypeError):
+                pass
+
     candidate_codes = {c: ind for c, ind in candidate_codes.items() if c in spot_map}
 
-    # 降级路径：板块拿不到时，取 spot 按今日涨幅+成交额排序的 Top 200
+    # 降级路径
     if not candidate_codes:
         print("   📥 退化方案：用 spot 涨幅+成交额 Top 200 作为候选池")
         sorted_spot = spot.copy()
@@ -81,8 +91,31 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
 
     print(f"   候选池 {len(candidate_codes)} 只")
 
+    # --- 大盘风险评级 ---
+    risk_score, risk_desc = _market_risk(dry_run=dry_run)
+    if risk_score <= 2:
+        msg = f"⚠️ 今日大盘风险评分 {risk_score}/10：{risk_desc}，跳过选股推送"
+        print(f"   {msg}")
+        if not dry_run:
+            send_to_wechat(f"⏸️ 选股暂停 {datetime.now().strftime('%m-%d')}", f"# {msg}\n\n大盘风险过高，今日不推送候选。")
+        return 0
+
+    # --- 资金维度（全市场北向净流入） ---
+    north_market_flow = _fetch_north_market_flow(dry_run=dry_run)
+    if north_market_flow is not None:
+        print(f"   💰 北向资金净流入 {north_market_flow:+.1f} 亿")
+
+    # --- 并发打分 ---
     print(f"📥 并发拉取日线 + 打分（{len(candidate_codes)} 只）…")
-    scored = list(_score_candidates_concurrent(candidate_codes, spot_map, dry_run))
+    scored = list(_score_candidates_concurrent(
+        candidate_codes, spot_map, dry_run,
+        north_market_flow=north_market_flow,
+        turnover_map=turnover_map,
+    ))
+
+    # --- 连续上榜惩罚 ---
+    streak_map = _compute_streak(scored)
+    scored = _adjust_for_repeats(scored, streak_map)
 
     scored.sort(key=lambda x: x.total, reverse=True)
     picks = scored[:top_n]
@@ -93,7 +126,11 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
 
     streak_map = _compute_streak(picks)
 
-    md = rpt.render_pick_report(industries, picks, streak_map=streak_map)
+    md = rpt.render_pick_report(
+        industries, picks, streak_map=streak_map,
+        risk_score=risk_score, risk_desc=risk_desc,
+        north_flow=north_market_flow,
+    )
 
     if dry_run:
         print("\n" + "=" * 60)
@@ -223,22 +260,92 @@ def _market_summary(dry_run: bool = False) -> dict:
         return {}
 
 
+def _market_risk(dry_run: bool = False) -> tuple[int, str]:
+    """大盘风险评级 0-10。
+
+    基于沪深300的 20 日涨跌幅 + 年化波动率：
+    - 8-10：强势市场
+    - 5-7：中性
+    - 3-4：偏弱，报告加 ⚠️
+    - 0-2：弱势，跳过选股
+    """
+    if dry_run:
+        return (7, "mock 数据，模拟中性市场")
+    try:
+        import akshare as ak
+
+        df = ak.stock_zh_index_daily(symbol="sh000300")
+        closes = df["close"].astype(float).tail(20)
+        if len(closes) < 10:
+            return (5, "沪深300数据不足")
+        chg_20d = (closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100
+        returns = closes.pct_change().dropna()
+        volatility = returns.std() * (252**0.5) * 100
+
+        if chg_20d > 3 and volatility < 25:
+            return (8, "市场趋势向上，波动可控")
+        if chg_20d > 1:
+            return (6, "市场温和上涨")
+        if chg_20d > -2:
+            return (4, "市场偏弱，注意风险")
+        if chg_20d > -5:
+            return (2, "市场明显下跌，建议谨慎")
+        return (0, "市场大幅下跌，主动回避")
+    except Exception as e:
+        print(f"   ⚠️  市场风险评级失败: {e}")
+        return (5, "接口异常，默认中性")
+
+
+def _fetch_north_market_flow(dry_run: bool = False) -> float | None:
+    """全市场北向资金净流入（亿元），失败返回 None。
+
+    个股北向几乎拿不到时回退到该全市场数据。
+    """
+    if dry_run:
+        return 38.5
+    try:
+        import akshare as ak
+
+        hsgt = ak.stock_hsgt_fund_flow_summary_em()
+        net = hsgt.iloc[-1]
+        for k, v in net.items():
+            if "净" in str(k) and "流入" in str(k):
+                return float(v)
+        return None
+    except Exception:
+        return None
+
+
+def _adjust_for_repeats(scored: list, streak_map: dict[str, int]) -> list:
+    """连续 3 天以上上榜则减 10 分，防止审美疲劳。"""
+    out = []
+    for s in scored:
+        streak = streak_map.get(s.code, 0)
+        if streak >= 3:
+            s.total = max(0, s.total - 10)
+        out.append(s)
+    return out
+
+
 def _score_candidates_concurrent(
     candidate_codes: dict[str, str],
     spot_map: dict[str, str],
     dry_run: bool,
+    north_market_flow: float | None = None,
+    turnover_map: dict[str, float] | None = None,
     max_workers: int = 8,
 ) -> list:
-    """并发拉取日线并打分，大幅缩短等待时间。
-
-    每只候选股票的网络 I/O 是主要瓶颈，8 线程并发可将 200 只从 ~5min 降到 ~1min。
-    使用默认 8 线程避免触发数据源限流。
-    """
+    """并发拉取日线并打分。"""
     def _work(code: str, industry: str):
         try:
             kline = dl.fetch_kline(code, days=80, use_mock=dry_run)
             north = dl.fetch_north_flow(code, use_mock=dry_run)
-            s = score_one(code, spot_map[code], industry, kline, north)
+            to = turnover_map.get(code) if turnover_map else None
+            s = score_one(
+                code, spot_map[code], industry, kline, north,
+                north_market_flow=north_market_flow,
+                turnover_rate=to,
+            )
             return s
         except Exception as e:  # noqa: BLE001
             print(f"   ⚠️  {code} 打分失败: {e}")
