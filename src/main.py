@@ -29,8 +29,8 @@ PICKS_DIR = Path(__file__).resolve().parent.parent / "picks"
 # ---------- pick ----------
 
 
-def cmd_pick(dry_run: bool = False, top_n: int = 5) -> int:
-    if not dry_run and not dl.is_trading_day():
+def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
+    if not dry_run and not force and not dl.is_trading_day():
         print("⏸️  今日非交易日，跳过推送")
         return 0
 
@@ -225,13 +225,14 @@ def main(argv=None) -> int:
     p_pick = sub.add_parser("pick", help="盘前选股")
     p_pick.add_argument("--dry-run", action="store_true", help="使用 mock 数据，不推送")
     p_pick.add_argument("--top", type=int, default=5)
+    p_pick.add_argument("--force", action="store_true", help="非交易日也强制运行（验证用）")
 
     p_rev = sub.add_parser("review", help="盘后复盘")
     p_rev.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args(argv)
     if args.cmd == "pick":
-        return cmd_pick(dry_run=args.dry_run, top_n=args.top)
+        return cmd_pick(dry_run=args.dry_run, top_n=args.top, force=args.force)
     if args.cmd == "review":
         return cmd_review(dry_run=args.dry_run)
     parser.print_help()
