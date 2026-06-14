@@ -153,32 +153,55 @@ def fetch_spot(use_mock: bool = False) -> pd.DataFrame:
 
 @_retry()
 def fetch_kline(code: str, days: int = 60, use_mock: bool = False) -> pd.DataFrame:
-    """单只股票日线。"""
+    """单只股票日线。优先东方财富，失败回退新浪。"""
     if use_mock:
         return _mock_kline(code, days)
     import akshare as ak
 
     end = datetime.now().strftime("%Y%m%d")
     start = (datetime.now() - timedelta(days=days * 2 + 30)).strftime("%Y%m%d")
-    df = ak.stock_zh_a_hist(
-        symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq"
-    )
-    return df.tail(days).reset_index(drop=True)
+
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq"
+        )
+        if df is not None and not df.empty:
+            return df.tail(days).reset_index(drop=True)
+    except Exception:
+        pass
+
+    # 新浪源
+    prefix = "sh" if code.startswith(("6", "9")) else "sz"
+    try:
+        df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="qfq")
+        rename = {"open": "开盘", "high": "最高", "low": "最低",
+                  "close": "收盘", "volume": "成交量", "amount": "成交额", "date": "日期"}
+        df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+        return df.tail(days).reset_index(drop=True)
+    except Exception as e:
+        raise e
 
 
 @_retry()
 def fetch_industry_rank(top_n: int = 5, use_mock: bool = False) -> pd.DataFrame:
-    """近 5 日涨幅最强的 N 个板块。"""
+    """近 5 日涨幅最强的 N 个板块。
+
+    海外环境下东方财富板块接口经常被拒，失败时返回空 DataFrame，
+    上层逻辑会改用 spot 全市场作为候选池。
+    """
     if use_mock:
         return _mock_industry_top(top_n)
     import akshare as ak
 
-    df = ak.stock_board_industry_name_em()
-    # 列名兼容性：东方财富板块字段经常是 板块名称/涨跌幅
-    name_col = "板块名称" if "板块名称" in df.columns else df.columns[1]
-    chg_col = next((c for c in df.columns if "涨跌幅" in c or "涨幅" in c), df.columns[-1])
-    df = df[[name_col, chg_col]].rename(columns={name_col: "板块名称", chg_col: "近5日涨幅"})
-    return df.sort_values("近5日涨幅", ascending=False).head(top_n).reset_index(drop=True)
+    try:
+        df = ak.stock_board_industry_name_em()
+        name_col = "板块名称" if "板块名称" in df.columns else df.columns[1]
+        chg_col = next((c for c in df.columns if "涨跌幅" in c or "涨幅" in c), df.columns[-1])
+        df = df[[name_col, chg_col]].rename(columns={name_col: "板块名称", chg_col: "近5日涨幅"})
+        return df.sort_values("近5日涨幅", ascending=False).head(top_n).reset_index(drop=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  板块涨幅接口失败: {e}, 将跳过板块择强")
+        return pd.DataFrame(columns=["板块名称", "近5日涨幅"])
 
 
 @_retry()
@@ -188,10 +211,14 @@ def fetch_industry_cons(industry: str, use_mock: bool = False) -> pd.DataFrame:
         return _mock_industry_cons(industry)
     import akshare as ak
 
-    df = ak.stock_board_industry_cons_em(symbol=industry)
-    return df[["代码", "名称"]] if "代码" in df.columns else df.iloc[:, :2].rename(
-        columns={df.columns[0]: "代码", df.columns[1]: "名称"}
-    )
+    try:
+        df = ak.stock_board_industry_cons_em(symbol=industry)
+        return df[["代码", "名称"]] if "代码" in df.columns else df.iloc[:, :2].rename(
+            columns={df.columns[0]: "代码", df.columns[1]: "名称"}
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  板块 {industry} 成分股接口失败: {e}")
+        return pd.DataFrame(columns=["代码", "名称"])
 
 
 def is_trading_day(use_mock: bool = False) -> bool:
