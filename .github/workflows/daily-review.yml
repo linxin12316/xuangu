@@ -1,27 +1,35 @@
 name: Daily Stock Review
-  
-  on:
-    schedule:
-      - cron: '5 8 * * 1-5'
-    workflow_dispatch: {}
 
-  permissions:
-    contents: read
+on:
+  schedule:
+    # UTC 08:05 = 北京时间 16:05，周一-周五
+    - cron: '5 8 * * 1-5'
+  workflow_dispatch: {}
 
-  jobs:
-    review:
-      runs-on: ubuntu-latest
-      timeout-minutes: 15
-      steps:
-        - uses: actions/checkout@v4
-        - uses: actions/setup-python@v5
-          with:
-            python-version: '3.11'
-            cache: pip
-        - run: |
-            python -m pip install --upgrade pip
-            pip install -r requirements.txt
-        - env:
-            SCKEY: ${{ secrets.SCKEY }}
-            TZ: Asia/Shanghai
-          run: python -m src.main review
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run review
+        env:
+          SCKEY: ${{ secrets.SCKEY }}
+          TZ: Asia/Shanghai
+        run: |
+          python -m src.main review
