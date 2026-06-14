@@ -231,10 +231,26 @@ def main(argv=None) -> int:
     p_rev.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args(argv)
-    if args.cmd == "pick":
-        return cmd_pick(dry_run=args.dry_run, top_n=args.top, force=args.force)
-    if args.cmd == "review":
-        return cmd_review(dry_run=args.dry_run)
+    try:
+        if args.cmd == "pick":
+            return cmd_pick(dry_run=args.dry_run, top_n=args.top, force=args.force)
+        if args.cmd == "review":
+            return cmd_review(dry_run=args.dry_run)
+    except Exception as e:  # noqa: BLE001
+        # 任何崩溃都推送一条微信提醒，避免静默失败
+        import traceback
+        tb = traceback.format_exc()
+        print(tb)
+        if not args.dry_run:
+            md = (
+                f"# ❌ 选股工具异常\n\n"
+                f"**错误**: `{type(e).__name__}: {e}`\n\n"
+                f"**说明**: 数据源接口不可用或网络故障。\n"
+                f"常见原因：东方财富/新浪对 GitHub 海外机房限流。\n\n"
+                f"**Action 日志**: 请到仓库 Actions 页面查看完整堆栈。\n"
+            )
+            send_to_wechat(f"❌ 选股异常 {datetime.now().strftime('%m-%d')}", md)
+        return 2
     parser.print_help()
     return 1
 
