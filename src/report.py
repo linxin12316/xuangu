@@ -20,10 +20,19 @@ def render_pick_report(
     industries: pd.DataFrame,
     picks: Sequence[Score],
     streak_map: dict[str, int] | None = None,
+    risk_score: int | None = None,
+    risk_desc: str | None = None,
+    north_flow: float | None = None,
 ) -> str:
     streak_map = streak_map or {}
     today = datetime.now().strftime("%Y-%m-%d")
     lines = [f"# 📈 选股报告 · {today}", "", DISCLAIMER, ""]
+
+    # 大盘风险提示
+    if risk_score is not None and risk_score <= 4:
+        icon = "🟡" if risk_score >= 3 else "🔴"
+        lines.append(f"> {icon} **大盘风险**：评级 {risk_score}/10 — {risk_desc or ''}")
+        lines.append("")
 
     if industries.empty:
         lines.append("## 🔥 强势板块")
@@ -39,10 +48,14 @@ def render_pick_report(
             lines.append(f"| {i+1} | {row['板块名称']} | {row['近5日涨幅']:.2f}% |")
         lines.append("")
 
+    if north_flow is not None:
+        lines.append(f"**全市场北向资金**：{north_flow:+.1f} 亿")
+        lines.append("")
+
     lines.append("## 🎯 候选个股（按综合分排序）")
     lines.append("")
-    lines.append("| # | 代码 | 名称 | 板块 | 综合分 | 趋势 | 量能 | 动量 | 资金 | 安全 | 现价 | 建议止损 | 标记 |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| # | 代码 | 名称 | 板块 | 综合分 | 趋势 | 量能 | 动量 | 资金 | 换手 | 安全 | 现价 | 建议止损 | 标记 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for i, s in enumerate(picks, 1):
         d = s.as_dict()
         streak = streak_map.get(s.code, 0)
@@ -50,9 +63,12 @@ def render_pick_report(
         lines.append(
             f"| {i} | {d['code']} | {d['name']} | {d['industry']} | "
             f"**{d['total']}** | {d['trend']} | {d['volume']} | {d['momentum']} | "
-            f"{d['fund']} | {d['safety']} | {d['last_close']} | "
+            f"{d['fund']} | {d['turnover']} | {d['safety']} | {d['last_close']} | "
             f"{d['suggested_stop_loss']} | {tag} |"
         )
+    lines.append("")
+
+    lines.append(f"*总分满分 110（趋势30+量能25+动量20+资金15+换手10+安全10）*")
     lines.append("")
 
     lines.append("## 📋 操作建议")
