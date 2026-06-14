@@ -31,9 +31,25 @@ def remove_bj(df: pd.DataFrame) -> pd.DataFrame:
     return df[~df["代码"].astype(str).str.startswith(("8", "4", "92"))].reset_index(drop=True)
 
 
+def remove_gem(df: pd.DataFrame) -> pd.DataFrame:
+    """剔除创业板（300xxx），波动大、非散户友好。"""
+    if "代码" not in df.columns:
+        return df
+    return df[~df["代码"].astype(str).str.startswith("300")].reset_index(drop=True)
+
+
+def remove_star(df: pd.DataFrame) -> pd.DataFrame:
+    """剔除科创板（688xxx），门槛高、波动大。"""
+    if "代码" not in df.columns:
+        return df
+    return df[~df["代码"].astype(str).str.startswith("688")].reset_index(drop=True)
+
+
 def apply_all(df: pd.DataFrame) -> pd.DataFrame:
     df = remove_st(df)
     df = remove_suspended(df)
     df = remove_small_cap(df)
     df = remove_bj(df)
+    df = remove_gem(df)
+    df = remove_star(df)
     return df
