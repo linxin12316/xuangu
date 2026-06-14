@@ -113,12 +113,41 @@ def _mock_industry_cons(industry: str) -> pd.DataFrame:
 
 @_retry()
 def fetch_spot(use_mock: bool = False) -> pd.DataFrame:
-    """全市场 A 股快照。"""
+    """全市场 A 股快照。
+
+    优先尝试东方财富 (stock_zh_a_spot_em)，失败回退到新浪 (stock_zh_a_spot)。
+    新浪对海外 IP 更友好，适合 GitHub Actions 海外 runner。
+    """
     if use_mock:
         return _mock_spot()
     import akshare as ak
 
-    df = ak.stock_zh_a_spot_em()
+    try:
+        df = ak.stock_zh_a_spot_em()
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  东方财富快照失败: {e}, 回退新浪源")
+
+    # 新浪源：列名不同，需要标准化
+    df = ak.stock_zh_a_spot()
+    rename_map = {
+        "symbol": "代码",
+        "code": "代码",
+        "name": "名称",
+        "trade": "最新价",
+        "changepercent": "涨跌幅",
+        "amount": "成交额",
+        "mktcap": "总市值",
+        "pb": "市净率",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    if "代码" in df.columns:
+        # 新浪代码带 sh/sz 前缀，去掉
+        df["代码"] = df["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
+    if "总市值" in df.columns:
+        # 新浪单位是万元，转换为元
+        df["总市值"] = pd.to_numeric(df["总市值"], errors="coerce") * 1e4
     return df
 
 
