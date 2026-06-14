@@ -1,4 +1,4 @@
-"""个股五维打分（0-100）。"""
+"""个股打分（六维 0-110）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,8 +19,9 @@ class Score:
     momentum: float
     fund: float
     safety: float
+    turnover: float
     last_close: float
-    suggested_stop_loss: float  # 止损建议价位
+    suggested_stop_loss: float
 
     def as_dict(self) -> dict:
         return {
@@ -33,6 +34,7 @@ class Score:
             "momentum": round(self.momentum, 1),
             "fund": round(self.fund, 1),
             "safety": round(self.safety, 1),
+            "turnover": round(self.turnover, 1),
             "last_close": round(self.last_close, 2),
             "suggested_stop_loss": round(self.suggested_stop_loss, 2),
         }
@@ -88,13 +90,40 @@ def score_momentum(closes: pd.Series) -> float:
     return 0.0
 
 
-def score_fund(north_change: Optional[float]) -> float:
-    """北向持股 5 日变动：>2% 给满分 15，0~2% 线性，<0 不得分。"""
-    if north_change is None:
-        return 7.0  # 数据缺失给中性分
-    if north_change <= 0:
-        return 0.0
-    return min(north_change / 2.0, 1.0) * 15.0
+def score_fund(
+    north_change: Optional[float] = None,
+    north_market_flow: Optional[float] = None,
+) -> float:
+    """北向资金 15 分。
+
+    优先用个股北向持股 5 日变动（海外 runner 几乎永远拿不到）。
+    拿不到时回退全市场北向净流入（亿元），该接口海外通。
+    都拿不到给中性 7 分。
+    """
+    if north_change is not None:
+        if north_change <= 0:
+            return 0.0
+        return min(north_change / 2.0, 1.0) * 15.0
+    if north_market_flow is not None:
+        # -100 亿净流出→0 分, +100 亿净流入→15 分
+        return max(0.0, min(15.0, 7.5 + north_market_flow * 7.5 / 100.0))
+    return 7.0
+
+
+def score_turnover(turnover_rate: Optional[float]) -> float:
+    """换手率评分（10 分）。
+
+    - 1%~5%：健康活跃 → 10 分
+    - 0.5~1% 或 5~10%：中性 → 5 分
+    - <0.5%（太冷）或 >10%（过热）→ 0 分
+    """
+    if turnover_rate is None:
+        return 5.0
+    if 1.0 <= turnover_rate <= 5.0:
+        return 10.0
+    if 0.5 <= turnover_rate < 1.0 or 5.0 < turnover_rate <= 10.0:
+        return 5.0
+    return 0.0
 
 
 def score_safety(closes: pd.Series) -> float:
@@ -119,6 +148,8 @@ def score_one(
     industry: str,
     kline: pd.DataFrame,
     north_change: Optional[float],
+    north_market_flow: Optional[float] = None,
+    turnover_rate: Optional[float] = None,
 ) -> Optional[Score]:
     if kline is None or kline.empty or "收盘" not in kline.columns:
         return None
@@ -130,11 +161,12 @@ def score_one(
     t = score_trend(closes)
     v = score_volume(volumes) if not volumes.empty else 0.0
     m = score_momentum(closes)
-    f = score_fund(north_change)
+    f = score_fund(north_change, north_market_flow)
     s = score_safety(closes)
+    to = score_turnover(turnover_rate)
 
     last = float(closes.iloc[-1])
-    # 止损建议：MA20 与 -7% 取较高者（避免假突破后深套）
+    # 止损建议：MA20 与 -7% 取较高者
     ma20 = _ma(closes, 20)
     stop = max(ma20, last * 0.93) if not np.isnan(ma20) else last * 0.93
 
@@ -142,12 +174,13 @@ def score_one(
         code=code,
         name=name,
         industry=industry,
-        total=t + v + m + f + s,
+        total=t + v + m + f + s + to,
         trend=t,
         volume=v,
         momentum=m,
         fund=f,
         safety=s,
+        turnover=to,
         last_close=last,
         suggested_stop_loss=stop,
     )
