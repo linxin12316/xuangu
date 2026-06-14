@@ -11,9 +11,9 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
-
 import pandas as pd
 
 from . import data_loader as dl
@@ -81,19 +81,8 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
 
     print(f"   候选池 {len(candidate_codes)} 只")
 
-    print("📥 拉日线 + 打分…")
-    scored = []
-    for i, (code, industry) in enumerate(candidate_codes.items(), 1):
-        if i % 20 == 0:
-            print(f"   进度 {i}/{len(candidate_codes)}")
-        try:
-            kline = dl.fetch_kline(code, days=80, use_mock=dry_run)
-            north = dl.fetch_north_flow(code, use_mock=dry_run)
-            s = score_one(code, spot_map[code], industry, kline, north)
-            if s and s.total > 0:
-                scored.append(s)
-        except Exception as e:  # noqa: BLE001
-            print(f"   ⚠️  {code} 打分失败: {e}")
+    print(f"📥 并发拉取日线 + 打分（{len(candidate_codes)} 只）…")
+    scored = list(_score_candidates_concurrent(candidate_codes, spot_map, dry_run))
 
     scored.sort(key=lambda x: x.total, reverse=True)
     picks = scored[:top_n]
@@ -232,6 +221,45 @@ def _market_summary(dry_run: bool = False) -> dict:
         return out
     except Exception:
         return {}
+
+
+def _score_candidates_concurrent(
+    candidate_codes: dict[str, str],
+    spot_map: dict[str, str],
+    dry_run: bool,
+    max_workers: int = 8,
+) -> list:
+    """并发拉取日线并打分，大幅缩短等待时间。
+
+    每只候选股票的网络 I/O 是主要瓶颈，8 线程并发可将 200 只从 ~5min 降到 ~1min。
+    使用默认 8 线程避免触发数据源限流。
+    """
+    def _work(code: str, industry: str):
+        try:
+            kline = dl.fetch_kline(code, days=80, use_mock=dry_run)
+            north = dl.fetch_north_flow(code, use_mock=dry_run)
+            s = score_one(code, spot_map[code], industry, kline, north)
+            return s
+        except Exception as e:  # noqa: BLE001
+            print(f"   ⚠️  {code} 打分失败: {e}")
+            return None
+
+    total = len(candidate_codes)
+    done = 0
+    results: list = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        fut_map = {
+            pool.submit(_work, code, ind): code
+            for code, ind in candidate_codes.items()
+        }
+        for fut in as_completed(fut_map):
+            done += 1
+            if done % 10 == 0 or done == total:
+                print(f"   进度 {done}/{total}")
+            s = fut.result()
+            if s and s.total > 0:
+                results.append(s)
+    return results
 
 
 # ---------- entry ----------
