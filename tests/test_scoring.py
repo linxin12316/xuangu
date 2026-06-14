@@ -99,7 +99,7 @@ def test_score_total_in_range():
     kl = _make_kline(60)
     score = scoring.score_one("000001", "test", "ind", kl, north_change=5.0)
     assert score is not None
-    assert 0 <= score.total <= 100, f"总分应在 0-100，实得 {score.total}"
+    assert 0 <= score.total <= 110, f"总分（含换手率）应在 0-110，实得 {score.total}"
 
 
 if __name__ == "__main__":
