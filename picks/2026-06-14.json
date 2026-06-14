@@ -13,30 +13,17 @@
     "suggested_stop_loss": 20.04
   },
   {
-    "code": "300353",
-    "name": "东土科技",
+    "code": "000759",
+    "name": "中百集团",
     "industry": "全市场",
-    "total": 90.5,
+    "total": 88.8,
     "trend": 30.0,
-    "volume": 23.5,
+    "volume": 21.8,
     "momentum": 20.0,
     "fund": 7.0,
     "safety": 10.0,
-    "last_close": 22.26,
-    "suggested_stop_loss": 20.73
-  },
-  {
-    "code": "688772",
-    "name": "珠海冠宇",
-    "industry": "全市场",
-    "total": 88.6,
-    "trend": 30.0,
-    "volume": 23.3,
-    "momentum": 20.0,
-    "fund": 7.0,
-    "safety": 8.3,
-    "last_close": 18.85,
-    "suggested_stop_loss": 17.53
+    "last_close": 5.83,
+    "suggested_stop_loss": 5.58
   },
   {
     "code": "002171",
@@ -50,6 +37,19 @@
     "safety": 8.8,
     "last_close": 13.59,
     "suggested_stop_loss": 12.64
+  },
+  {
+    "code": "603588",
+    "name": "高能环境",
+    "industry": "全市场",
+    "total": 85.6,
+    "trend": 30.0,
+    "volume": 18.6,
+    "momentum": 20.0,
+    "fund": 7.0,
+    "safety": 10.0,
+    "last_close": 14.21,
+    "suggested_stop_loss": 13.22
   },
   {
     "code": "603039",
