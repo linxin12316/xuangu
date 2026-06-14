@@ -25,13 +25,19 @@ def render_pick_report(
     today = datetime.now().strftime("%Y-%m-%d")
     lines = [f"# 📈 选股报告 · {today}", "", DISCLAIMER, ""]
 
-    lines.append("## 🔥 强势板块 Top 5（近 5 日涨幅）")
-    lines.append("")
-    lines.append("| 排名 | 板块 | 近5日涨幅 |")
-    lines.append("| --- | --- | --- |")
-    for i, row in industries.iterrows():
-        lines.append(f"| {i+1} | {row['板块名称']} | {row['近5日涨幅']:.2f}% |")
-    lines.append("")
+    if industries.empty:
+        lines.append("## 🔥 强势板块")
+        lines.append("")
+        lines.append("> ⚠️ 板块接口在海外机房不可用，已降级为全市场涨幅排序。")
+        lines.append("")
+    else:
+        lines.append("## 🔥 强势板块 Top 5（近 5 日涨幅）")
+        lines.append("")
+        lines.append("| 排名 | 板块 | 近5日涨幅 |")
+        lines.append("| --- | --- | --- |")
+        for i, row in industries.iterrows():
+            lines.append(f"| {i+1} | {row['板块名称']} | {row['近5日涨幅']:.2f}% |")
+        lines.append("")
 
     lines.append("## 🎯 候选个股（按综合分排序）")
     lines.append("")
