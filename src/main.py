@@ -43,23 +43,42 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
 
     print("📥 计算强势板块…")
     industries = dl.fetch_industry_rank(top_n=5, use_mock=dry_run)
-    print(f"   Top 5: {industries['板块名称'].tolist()}")
+    if not industries.empty:
+        print(f"   Top 5: {industries['板块名称'].tolist()}")
+    else:
+        print("   ⚠️  板块接口不可用，降级为全市场涨幅排序")
 
     candidate_codes: dict[str, str] = {}  # code -> industry
-    for _, row in industries.iterrows():
-        try:
-            cons = dl.fetch_industry_cons(row["板块名称"], use_mock=dry_run)
-            for _, c in cons.iterrows():
-                code = str(c["代码"]).zfill(6)
-                if code not in candidate_codes:
-                    candidate_codes[code] = row["板块名称"]
-        except Exception as e:  # noqa: BLE001
-            print(f"   ⚠️  板块 {row['板块名称']} 成分股获取失败: {e}")
+    if not industries.empty:
+        for _, row in industries.iterrows():
+            try:
+                cons = dl.fetch_industry_cons(row["板块名称"], use_mock=dry_run)
+                for _, c in cons.iterrows():
+                    code = str(c["代码"]).zfill(6)
+                    if code not in candidate_codes:
+                        candidate_codes[code] = row["板块名称"]
+            except Exception as e:  # noqa: BLE001
+                print(f"   ⚠️  板块 {row['板块名称']} 成分股获取失败: {e}")
 
     # 与 spot 取交集（过滤掉 ST/小市值/北交所）
     name_col = "名称" if "名称" in spot.columns else spot.columns[1]
     spot_map = {str(r["代码"]).zfill(6): r[name_col] for _, r in spot.iterrows()}
     candidate_codes = {c: ind for c, ind in candidate_codes.items() if c in spot_map}
+
+    # 降级路径：板块拿不到时，取 spot 按今日涨幅+成交额排序的 Top 200
+    if not candidate_codes:
+        print("   📥 退化方案：用 spot 涨幅+成交额 Top 200 作为候选池")
+        sorted_spot = spot.copy()
+        if "涨跌幅" in sorted_spot.columns and "成交额" in sorted_spot.columns:
+            sorted_spot["__rank"] = (
+                sorted_spot["涨跌幅"].fillna(0).rank(pct=True) * 0.5
+                + sorted_spot["成交额"].fillna(0).rank(pct=True) * 0.5
+            )
+            sorted_spot = sorted_spot.sort_values("__rank", ascending=False)
+        for _, r in sorted_spot.head(200).iterrows():
+            code = str(r["代码"]).zfill(6)
+            candidate_codes[code] = "全市场"
+
     print(f"   候选池 {len(candidate_codes)} 只")
 
     print("📥 拉日线 + 打分…")
