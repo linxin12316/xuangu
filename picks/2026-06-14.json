@@ -1,0 +1,67 @@
+[
+  {
+    "code": "002657",
+    "name": "中科金财",
+    "industry": "全市场",
+    "total": 92.0,
+    "trend": 30.0,
+    "volume": 25.0,
+    "momentum": 20.0,
+    "fund": 7.0,
+    "safety": 10.0,
+    "last_close": 21.55,
+    "suggested_stop_loss": 20.04
+  },
+  {
+    "code": "300353",
+    "name": "东土科技",
+    "industry": "全市场",
+    "total": 90.5,
+    "trend": 30.0,
+    "volume": 23.5,
+    "momentum": 20.0,
+    "fund": 7.0,
+    "safety": 10.0,
+    "last_close": 22.26,
+    "suggested_stop_loss": 20.73
+  },
+  {
+    "code": "688772",
+    "name": "珠海冠宇",
+    "industry": "全市场",
+    "total": 88.6,
+    "trend": 30.0,
+    "volume": 23.3,
+    "momentum": 20.0,
+    "fund": 7.0,
+    "safety": 8.3,
+    "last_close": 18.85,
+    "suggested_stop_loss": 17.53
+  },
+  {
+    "code": "002171",
+    "name": "楚江新材",
+    "industry": "全市场",
+    "total": 88.4,
+    "trend": 30.0,
+    "volume": 22.6,
+    "momentum": 20.0,
+    "fund": 7.0,
+    "safety": 8.8,
+    "last_close": 13.59,
+    "suggested_stop_loss": 12.64
+  },
+  {
+    "code": "603039",
+    "name": "泛微网络",
+    "industry": "全市场",
+    "total": 85.3,
+    "trend": 30.0,
+    "volume": 25.0,
+    "momentum": 20.0,
+    "fund": 7.0,
+    "safety": 3.3,
+    "last_close": 47.61,
+    "suggested_stop_loss": 44.28
+  }
+]
