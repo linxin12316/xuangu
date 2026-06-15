@@ -2,8 +2,9 @@ name: Daily Stock Review
 
 on:
   schedule:
-    # UTC 08:05 = 北京时间 16:05，周一-周五
-    - cron: '5 8 * * 1-5'
+    # UTC 08:07 = 北京时间 16:07，周一-周五
+    # 避开 :00 / :05 / :30 等高拥堵分钟,GitHub 私有仓 schedule 容易被丢
+    - cron: '7 8 * * 1-5'
   workflow_dispatch: {}
 
 permissions:
