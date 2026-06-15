@@ -100,6 +100,65 @@ def test_candidate_pool_filters_by_hot_industries():
     assert selected == {"600519", "300750"}, f"应只剩白酒和电池里的, 实得 {selected}"
 
 
+# ---------- 新数据源测试 ----------
+
+
+def test_concept_fundflow_mock():
+    """概念资金流 mock 应能拿到 ≥4 个概念。"""
+    dl._reset_caches_for_test()
+    df = dl.fetch_concept_fundflow(use_mock=True)
+    assert df is not None and len(df) >= 4
+    assert "行业" in df.columns
+    assert "净额" in df.columns
+    # 排序应按净额降序
+    nets = df["净额"].tolist()
+    assert nets == sorted(nets, reverse=True), "应按净额降序"
+
+
+def test_industry_fundflow_mock():
+    dl._reset_caches_for_test()
+    df = dl.fetch_industry_fundflow(use_mock=True)
+    assert df is not None and len(df) >= 3
+
+
+def test_zt_pool_mock_has_streak():
+    dl._reset_caches_for_test()
+    df = dl.fetch_zt_pool(use_mock=True)
+    assert df is not None and not df.empty
+    assert "连板数" in df.columns
+    # mock 里应有≥1只 ≥2 连板
+    assert (df["连板数"] >= 2).any()
+
+
+def test_lhb_detail_mock_has_net_buy():
+    dl._reset_caches_for_test()
+    df = dl.fetch_lhb_detail(use_mock=True)
+    assert df is not None and not df.empty
+    assert "龙虎榜净买额" in df.columns
+
+
+def test_get_stock_market_signals_zt_streak():
+    """连板股查得到正确连板数。"""
+    dl._reset_caches_for_test()
+    sig = dl.get_stock_market_signals("603065", use_mock=True)
+    assert sig["zt_streak"] == 4, f"宿迁联盛 mock 是 4 板,实得 {sig['zt_streak']}"
+
+
+def test_get_stock_market_signals_lhb_net_buy():
+    """龙虎榜查到净买额。"""
+    dl._reset_caches_for_test()
+    sig = dl.get_stock_market_signals("603065", use_mock=True)
+    assert sig["lhb_net_buy"] == 2.5e8
+
+
+def test_get_stock_market_signals_no_data():
+    """非热门股查不到信号。"""
+    dl._reset_caches_for_test()
+    sig = dl.get_stock_market_signals("999999", use_mock=True)
+    assert sig["zt_streak"] == 0
+    assert sig["lhb_net_buy"] is None
+
+
 if __name__ == "__main__":
     import traceback
 
