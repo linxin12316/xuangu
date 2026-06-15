@@ -1,0 +1,44 @@
+name: Weekly Backtest Summary
+
+on:
+  schedule:
+    # UTC 10:00 = 北京时间 18:00，周日跑回测发周报
+    - cron: '0 10 * * 0'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: '回看天数（默认 14）'
+        type: string
+        default: '14'
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backtest
+        env:
+          SCKEY: ${{ secrets.SCKEY }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          TZ: Asia/Shanghai
+        run: |
+          DAYS="${{ inputs.days }}"
+          python -m src.backtest --days ${DAYS:-14}
