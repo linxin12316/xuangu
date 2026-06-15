@@ -848,8 +848,10 @@ def fetch_zt_pool(use_mock: bool = False) -> Optional[pd.DataFrame]:
         return _ZT_POOL_CACHE
     try:
         import akshare as ak
-        # 取昨天作为涨停日（A 股盘前推送，今日涨停还没产生）
-        for offset in range(1, 6):
+        # 从今天开始向前找最近一个有数据的交易日。
+        # 盘前 8:27 跑时今日涨停还没产生 → 接口返回空 → 自动回退昨天
+        # 盘后 18:23 跑时今日数据已稳定 → 直接拿到今日
+        for offset in range(0, 6):
             d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
             try:
                 df = ak.stock_zt_pool_em(date=d)
@@ -859,7 +861,7 @@ def fetch_zt_pool(use_mock: bool = False) -> Optional[pd.DataFrame]:
                 _ZT_POOL_CACHE = df
                 print(f"   ✅ 涨停池 {d} {len(df)} 只")
                 return _ZT_POOL_CACHE
-        print("   ⚠️  涨停池近 5 天无数据")
+        print("   ⚠️  涨停池近 6 天无数据")
         return None
     except Exception as e:  # noqa: BLE001
         print(f"   ⚠️  涨停池失败: {e}")
@@ -886,7 +888,8 @@ def fetch_lhb_detail(use_mock: bool = False) -> Optional[pd.DataFrame]:
         return _LHB_DETAIL_CACHE
     try:
         import akshare as ak
-        for offset in range(1, 6):
+        # 同 zt_pool: 盘前/盘后通用,从今天往前找最近有数据的一天
+        for offset in range(0, 6):
             d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
             try:
                 df = ak.stock_lhb_detail_em(start_date=d, end_date=d)
