@@ -155,26 +155,32 @@ def score_safety(closes: pd.Series) -> float:
     return float(8.0 * (0.30 - deviation) / 0.15)
 
 
-def score_limit_up(limit_times_10d: int = 0, max_streak: int = 0) -> float:
+def score_limit_up(zt_streak: int = 0, limit_times_10d: int = 0) -> float:
     """涨停强度 10 分。
 
-    - 近期(7日窗口)涨停 1 次 → 4 分
-    - 涨停 2 次 → 6 分
-    - 涨停 3+ 次 → 8 分
-    - 同时有连板(max_streak ≥ 2) → 额外 +2 分(最高 10)
-    - 完全无涨停 → 0 分
+    数据源（按优先级）:
+      - zt_streak: 来自 stock_zt_pool_em 的"连板数"字段（昨日涨停时该值≥1，最稳定）
+      - limit_times_10d: 来自 Tushare limit_list_d 的近期次数（限速时常缺）
+
+    评分:
+      - 4 连板及以上 → 10 分（妖股级）
+      - 3 连板 → 8 分
+      - 2 连板 → 6 分
+      - 1 连板（昨日刚涨停）→ 4 分
+      - 近 7 日有涨停（仅靠 limit_times_10d）→ 2 分
+      - 否则 0 分
     """
-    if limit_times_10d <= 0 and max_streak <= 0:
-        return 0.0
-    base = 0.0
-    if limit_times_10d >= 3:
-        base = 8.0
-    elif limit_times_10d == 2:
-        base = 6.0
-    elif limit_times_10d == 1:
-        base = 4.0
-    bonus = 2.0 if max_streak >= 2 else 0.0
-    return min(10.0, base + bonus)
+    if zt_streak >= 4:
+        return 10.0
+    if zt_streak == 3:
+        return 8.0
+    if zt_streak == 2:
+        return 6.0
+    if zt_streak == 1:
+        return 4.0
+    if limit_times_10d >= 1:
+        return 2.0
+    return 0.0
 
 
 def score_valuation(
@@ -225,16 +231,25 @@ def score_valuation(
     return float(pe_score + pb_score)
 
 
-def score_longhu(longhu_active: Optional[bool] = None) -> float:
+def score_longhu(lhb_net_buy: Optional[float] = None) -> float:
     """龙虎榜活跃度 5 分。
 
-    Tushare top_list 接口需要 2000 积分，免费版无法使用，
-    longhu_active=None 时退化为中性 2.5 分。
-    True → 5 分；False → 0 分。
+    lhb_net_buy: 来自 stock_lhb_detail_em 的"龙虎榜净买额"字段（元）。
+      - None: 未上榜（也未拉到数据）→ 中性 2.5 分
+      - > 5000万: 大资金净买入 → 5 分
+      - 0 ~ 5000万: 小幅净买入 → 4 分
+      - 0: 平 → 2.5 分
+      - < 0: 净卖出（上榜+卖出常预示出货）→ 0 分
     """
-    if longhu_active is None:
+    if lhb_net_buy is None:
         return 2.5
-    return 5.0 if longhu_active else 0.0
+    if lhb_net_buy >= 5e7:
+        return 5.0
+    if lhb_net_buy > 0:
+        return 4.0
+    if lhb_net_buy == 0:
+        return 2.5
+    return 0.0
 
 
 def score_finance(
@@ -290,11 +305,11 @@ def score_one(
     north_change: Optional[float],
     north_market_flow: Optional[float] = None,
     turnover_rate: Optional[float] = None,
+    zt_streak: int = 0,
     limit_times_10d: int = 0,
-    max_streak: int = 0,
     pe_ttm: Optional[float] = None,
     pb: Optional[float] = None,
-    longhu_active: Optional[bool] = None,
+    lhb_net_buy: Optional[float] = None,
     roe: Optional[float] = None,
     profit_growth: Optional[float] = None,
 ) -> Optional[Score]:
@@ -311,9 +326,9 @@ def score_one(
     f = score_fund(north_change, north_market_flow)
     s = score_safety(closes)
     to = score_turnover(turnover_rate)
-    lu = score_limit_up(limit_times_10d, max_streak)
+    lu = score_limit_up(zt_streak=zt_streak, limit_times_10d=limit_times_10d)
     val = score_valuation(pe_ttm, pb)
-    lh = score_longhu(longhu_active)
+    lh = score_longhu(lhb_net_buy)
     fin = score_finance(roe, profit_growth)
 
     last = float(closes.iloc[-1])
