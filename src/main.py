@@ -19,6 +19,7 @@ import pandas as pd
 from . import data_loader as dl
 from . import filters as flt
 from . import report as rpt
+from .config import load_config, apply_blacklist, dedup_by_industry
 from .notifier import send_to_wechat
 from .scoring import score_one
 
@@ -34,12 +35,24 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
         print("⏸️  今日非交易日，跳过推送")
         return 0
 
+    cfg = load_config()
+    print(f"📋 配置：黑名单 {len(cfg['blacklist']['codes'])} 代码 / "
+          f"{len(cfg['blacklist']['name_keywords'])} 关键词，"
+          f"同行业上限 {cfg['max_per_industry']}，Top {cfg['max_picks']}")
+    top_n = cfg.get("max_picks", top_n)
+
     print("📥 拉取全市场快照…")
     spot = dl.fetch_spot(use_mock=dry_run)
     print(f"   全市场 {len(spot)} 只")
 
     spot = flt.apply_all(spot)
     print(f"   过滤地雷股后剩 {len(spot)} 只")
+
+    spot = apply_blacklist(spot, cfg["blacklist"])
+    print(f"   过滤黑名单后剩 {len(spot)} 只")
+
+    # 行业映射（Tushare stock_basic，免费可用）
+    industry_map = dl.fetch_industry_map(use_mock=dry_run)
 
     print("📥 计算强势板块…")
     industries = dl.fetch_industry_rank(top_n=5, use_mock=dry_run)
@@ -87,7 +100,8 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
             sorted_spot = sorted_spot.sort_values("__rank", ascending=False)
         for _, r in sorted_spot.head(200).iterrows():
             code = str(r["代码"]).zfill(6)
-            candidate_codes[code] = "全市场"
+            # 用 Tushare 行业映射;查不到时回退"全市场"
+            candidate_codes[code] = industry_map.get(code, "全市场")
 
     print(f"   候选池 {len(candidate_codes)} 只")
 
@@ -124,7 +138,11 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     scored = _adjust_for_repeats(scored, streak_map)
 
     scored.sort(key=lambda x: x.total, reverse=True)
-    picks = scored[:top_n]
+    # --- 同行业去重（Top 5 中同一行业最多保留 N 只）---
+    deduped = dedup_by_industry(scored, max_per_industry=cfg["max_per_industry"])
+    if len(deduped) < len(scored):
+        print(f"   🧹 同行业去重：{len(scored)} → {len(deduped)} (上限 {cfg['max_per_industry']}/行业)")
+    picks = deduped[:top_n]
 
     print(f"\n🏆 Top {len(picks)}:")
     for i, s in enumerate(picks, 1):
