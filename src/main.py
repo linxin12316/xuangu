@@ -54,24 +54,20 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     # 行业映射（Tushare stock_basic，免费可用）
     industry_map = dl.fetch_industry_map(use_mock=dry_run)
 
-    print("📥 计算强势板块…")
-    industries = dl.fetch_industry_rank(top_n=5, use_mock=dry_run)
+    # 全市场近 5 日涨幅快照（Tushare daily by trade_date，免费可用）
+    market_window = dl.fetch_market_window(days=6, use_mock=dry_run)
+
+    print("📥 计算强势板块（行业平均5日涨幅）…")
+    # 取 Top 8 热门行业(给后面留够个股筛选空间)
+    industries = dl.fetch_industry_rank(top_n=8, use_mock=dry_run)
     if not industries.empty:
-        print(f"   Top 5: {industries['板块名称'].tolist()}")
+        members_col = "成员数" if "成员数" in industries.columns else None
+        info = industries['板块名称'].tolist()
+        if members_col:
+            info = [f"{n}({c}只)" for n, c in zip(industries['板块名称'], industries[members_col])]
+        print(f"   Top 8 热门行业: {info}")
     else:
         print("   ⚠️  板块接口不可用，降级为全市场涨幅排序")
-
-    candidate_codes: dict[str, str] = {}  # code -> industry
-    if not industries.empty:
-        for _, row in industries.iterrows():
-            try:
-                cons = dl.fetch_industry_cons(row["板块名称"], use_mock=dry_run)
-                for _, c in cons.iterrows():
-                    code = str(c["代码"]).zfill(6)
-                    if code not in candidate_codes:
-                        candidate_codes[code] = row["板块名称"]
-            except Exception as e:  # noqa: BLE001
-                print(f"   ⚠️  板块 {row['板块名称']} 成分股获取失败: {e}")
 
     # 构建 spot_map + turnover_map
     name_col = "名称" if "名称" in spot.columns else spot.columns[1]
@@ -86,11 +82,47 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
             except (ValueError, TypeError):
                 pass
 
-    candidate_codes = {c: ind for c, ind in candidate_codes.items() if c in spot_map}
+    candidate_codes: dict[str, str] = {}  # code -> industry
+    # 路径 A: 行业择强 + 个股趋势双重筛选
+    if not industries.empty and market_window is not None and not market_window.empty:
+        hot_industries = set(industries["板块名称"].tolist())
+        # 1) 给所有股票打上行业标签
+        df = market_window.copy()
+        df["industry"] = df["code"].map(industry_map)
+        # 2) 只保留热门行业的股票
+        df = df[df["industry"].isin(hot_industries)]
+        # 3) 股票必须在 spot_map 里(能拿到现价/换手率)且未被黑名单/地雷股过滤掉
+        df = df[df["code"].isin(spot_map.keys())]
+        # 4) 按个股 5 日涨幅 + 成交额加权排序,取 Top 200
+        if not df.empty:
+            df["__rank"] = (
+                df["chg_5d"].fillna(0).rank(pct=True) * 0.6
+                + df["amount_now"].fillna(0).rank(pct=True) * 0.4
+            )
+            df = df.sort_values("__rank", ascending=False).head(200)
+            for _, r in df.iterrows():
+                candidate_codes[r["code"]] = r["industry"]
+            print(f"   ✅ 热门行业候选池 {len(candidate_codes)} 只 (行业 Top {len(hot_industries)} → 个股 Top 200)")
 
     # 降级路径
     if not candidate_codes:
-        print("   📥 退化方案：用 spot 涨幅+成交额 Top 200 作为候选池")
+        # 优先用 market_window 的真 5 日涨幅
+        if market_window is not None and not market_window.empty:
+            print("   📥 退化方案 A：全市场近5日涨幅+成交额 Top 200")
+            df = market_window.copy()
+            df = df[df["code"].isin(spot_map.keys())]
+            if not df.empty:
+                df["__rank"] = (
+                    df["chg_5d"].fillna(0).rank(pct=True) * 0.6
+                    + df["amount_now"].fillna(0).rank(pct=True) * 0.4
+                )
+                df = df.sort_values("__rank", ascending=False).head(200)
+                for _, r in df.iterrows():
+                    candidate_codes[r["code"]] = industry_map.get(r["code"], "全市场")
+
+    if not candidate_codes:
+        # 最差降级:用 spot 单日数据
+        print("   📥 退化方案 B：用 spot 当日涨幅+成交额 Top 200 作为候选池")
         sorted_spot = spot.copy()
         if "涨跌幅" in sorted_spot.columns and "成交额" in sorted_spot.columns:
             sorted_spot["__rank"] = (
