@@ -54,21 +54,23 @@ def render_pick_report(
 
     lines.append("## 🎯 候选个股（按综合分排序）")
     lines.append("")
-    lines.append("| # | 代码 | 名称 | 板块 | 综合分 | 趋势 | 量能 | 动量 | 资金 | 换手 | 安全 | 现价 | 建议止损 | 标记 |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| # | 代码 | 名称 | 板块 | 综合 | 趋势 | 量能 | 动量 | 资金 | 安全 | 换手 | 涨停 | 估值 | 龙虎 | 财务 | 现价 | 止损 | 标记 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for i, s in enumerate(picks, 1):
         d = s.as_dict()
         streak = streak_map.get(s.code, 0)
-        tag = f"🔁 连续上榜{streak}日" if streak >= 2 else ""
+        tag = f"🔁 连{streak}日" if streak >= 2 else ""
         lines.append(
             f"| {i} | {d['code']} | {d['name']} | {d['industry']} | "
             f"**{d['total']}** | {d['trend']} | {d['volume']} | {d['momentum']} | "
-            f"{d['fund']} | {d['turnover']} | {d['safety']} | {d['last_close']} | "
-            f"{d['suggested_stop_loss']} | {tag} |"
+            f"{d['fund']} | {d['safety']} | {d['turnover']} | {d['limit_up']} | "
+            f"{d['valuation']} | {d['longhu']} | {d['finance']} | "
+            f"{d['last_close']} | {d['suggested_stop_loss']} | {tag} |"
         )
     lines.append("")
 
-    lines.append(f"*总分满分 110（趋势30+量能25+动量20+资金15+换手10+安全10）*")
+    lines.append("*总分满分 100（趋势22+量能18+动量12+资金10+安全8+换手5+涨停10+估值10+龙虎5+财务5）*")
+    lines.append("*龙虎榜/财务因子需 Tushare 2000 积分接口，当前免费版给中性 2.5 分*")
     lines.append("")
 
     lines.append("## 📋 操作建议")
@@ -78,7 +80,7 @@ def render_pick_report(
     lines.append("- 综合分 70 以下的标的优先级降低")
     lines.append("- 同一板块最多同时持有 2 只，避免过度集中")
     lines.append("")
-    lines.append(f"*数据来源：东方财富 / 同花顺（akshare）*  \n*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+    lines.append(f"*数据来源：Tushare（K线/北向/估值/涨停）+ akshare（spot/板块）*  \n*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
 
     return "\n".join(lines)
 
