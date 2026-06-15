@@ -2,8 +2,9 @@ name: Daily Stock Pick
 
 on:
   schedule:
-    # UTC 00:30 = 北京时间 08:30，周一-周五
-    - cron: '30 0 * * 1-5'
+    # UTC 00:27 = 北京时间 08:27，周一-周五
+    # 注意:避开 :00 / :30 整点(GitHub 高负载时段会丢弃私有仓库的 schedule)
+    - cron: '27 0 * * 1-5'
   workflow_dispatch:
     inputs:
       force:
