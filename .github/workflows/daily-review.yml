@@ -33,6 +33,7 @@ jobs:
       - name: Run review
         env:
           SCKEY: ${{ secrets.SCKEY }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           TZ: Asia/Shanghai
         run: |
           python -m src.main review
