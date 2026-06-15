@@ -144,23 +144,43 @@ def _mock_kline(code: str, days: int = 60) -> pd.DataFrame:
 
 
 _MOCK_INDUSTRIES = [
-    ("电力设备", 8.5),
-    ("电子", 6.2),
-    ("汽车", 5.8),
-    ("食品饮料", 4.1),
+    ("白酒", 8.5),
+    ("电池", 6.2),
+    ("汽车整车", 5.8),
+    ("证券", 4.1),
     ("银行", 0.5),
-    ("钢铁", -1.2),
+    ("化学制药", -1.2),
 ]
 
 
 def _mock_industry_top(top_n: int = 5) -> pd.DataFrame:
     df = pd.DataFrame(_MOCK_INDUSTRIES, columns=["板块名称", "近5日涨幅"])
+    df["成员数"] = 8  # 占位
     return df.head(top_n)
 
 
+# mock 行业 → 该行业的 mock 代码（与 fetch_industry_map 的 mock 数据保持一致）
+_MOCK_INDUSTRY_CONS = {
+    "白酒": [("600519", "贵州茅台"), ("000858", "五粮液")],
+    "电池": [("300750", "宁德时代")],
+    "汽车整车": [("002594", "比亚迪")],
+    "保险": [("601318", "中国平安")],
+    "银行": [("000001", "平安银行"), ("600036", "招商银行")],
+    "电力": [("600900", "长江电力")],
+    "家电": [("000333", "美的集团")],
+    "化学制药": [("600276", "恒瑞医药")],
+    "证券": [("300059", "东方财富"), ("600030", "中信证券")],
+    "安防设备": [("002415", "海康威视")],
+    "面板": [("000725", "京东方Α")],
+    "光伏设备": [("601012", "隆基绿能")],
+}
+
+
 def _mock_industry_cons(industry: str) -> pd.DataFrame:
-    spot = _mock_spot()
-    return spot.head(5)[["代码", "名称"]]
+    items = _MOCK_INDUSTRY_CONS.get(industry, [])
+    if not items:
+        return pd.DataFrame(columns=["代码", "名称"])
+    return pd.DataFrame(items, columns=["代码", "名称"])
 
 
 # ---------- 真实接口封装 ----------
@@ -274,14 +294,39 @@ def fetch_kline(code: str, days: int = 60, use_mock: bool = False) -> pd.DataFra
 def fetch_industry_rank(top_n: int = 5, use_mock: bool = False) -> pd.DataFrame:
     """近 5 日涨幅最强的 N 个板块。
 
-    海外环境下东方财富板块接口经常被拒，失败时返回空 DataFrame，
-    上层逻辑会改用 spot 全市场作为候选池。
-    Tushare index_classify 需要 2000 积分，免费版不可用。
+    优先用 Tushare 聚合数据（fetch_market_window + fetch_industry_map）：
+    全市场每只股票的 5 日涨幅按 stock_basic 行业聚合 → 取行业平均涨幅 Top N。
+    要求每个行业至少有 5 只股票，避免小样本噪音。
+
+    Tushare 路径不可用时回退东方财富板块接口（akshare），海外环境通常不通。
+    都失败时返回空 DataFrame，由 main.py 触发"全市场降级"。
     """
     if use_mock:
         return _mock_industry_top(top_n)
-    import akshare as ak
 
+    # 优先 Tushare 聚合
+    window = fetch_market_window(use_mock=False)
+    ind_map = fetch_industry_map(use_mock=False)
+    if window is not None and not window.empty and ind_map:
+        df = window.copy()
+        df["industry"] = df["code"].map(ind_map)
+        df = df.dropna(subset=["industry", "chg_5d"])
+        if not df.empty:
+            agg = (
+                df.groupby("industry")
+                  .agg(成员数=("code", "count"), 近5日涨幅=("chg_5d", "mean"))
+                  .reset_index()
+            )
+            # 过滤小样本: 至少 5 只成分股,避免小行业被极端值带偏
+            agg = agg[agg["成员数"] >= 5]
+            if not agg.empty:
+                agg = agg.sort_values("近5日涨幅", ascending=False).head(top_n)
+                agg = agg[["industry", "近5日涨幅", "成员数"]].rename(columns={"industry": "板块名称"})
+                print(f"   ✅ Tushare 行业择强 Top {top_n}: {agg['板块名称'].tolist()}")
+                return agg.reset_index(drop=True)
+
+    # 回退 akshare
+    import akshare as ak
     try:
         df = ak.stock_board_industry_name_em()
         name_col = "板块名称" if "板块名称" in df.columns else df.columns[1]
@@ -295,11 +340,19 @@ def fetch_industry_rank(top_n: int = 5, use_mock: bool = False) -> pd.DataFrame:
 
 @_retry()
 def fetch_industry_cons(industry: str, use_mock: bool = False) -> pd.DataFrame:
-    """板块成分股。"""
+    """板块成分股。优先 Tushare 行业映射,失败回退 akshare。"""
     if use_mock:
         return _mock_industry_cons(industry)
-    import akshare as ak
 
+    # 优先用 Tushare stock_basic 行业聚合
+    ind_map = fetch_industry_map(use_mock=False)
+    if ind_map:
+        codes = [c for c, ind in ind_map.items() if ind == industry]
+        if codes:
+            return pd.DataFrame({"代码": codes, "名称": ["" for _ in codes]})
+
+    # 回退 akshare
+    import akshare as ak
     try:
         df = ak.stock_board_industry_cons_em(symbol=industry)
         return df[["代码", "名称"]] if "代码" in df.columns else df.iloc[:, :2].rename(
@@ -548,6 +601,7 @@ def _reset_caches_for_test():
     global _HK_HOLD_CACHE, _DAILY_BASIC_CACHE, _LIMIT_LIST_CACHE
     global _HK_HOLD_TRIED, _DAILY_BASIC_TRIED, _LIMIT_LIST_TRIED
     global _INDUSTRY_MAP_CACHE, _INDUSTRY_MAP_TRIED
+    global _MARKET_WINDOW_CACHE, _MARKET_WINDOW_TRIED
     _HK_HOLD_CACHE = None
     _DAILY_BASIC_CACHE = None
     _LIMIT_LIST_CACHE = None
@@ -556,6 +610,8 @@ def _reset_caches_for_test():
     _LIMIT_LIST_TRIED = False
     _INDUSTRY_MAP_CACHE = None
     _INDUSTRY_MAP_TRIED = False
+    _MARKET_WINDOW_CACHE = None
+    _MARKET_WINDOW_TRIED = False
 
 
 # ---------- 全市场行业映射（Tushare stock_basic, 不限速）----------
@@ -602,3 +658,87 @@ def fetch_industry_map(use_mock: bool = False) -> dict:
         print(f"   ⚠️  Tushare stock_basic 失败: {e}")
         _INDUSTRY_MAP_CACHE = {}
         return {}
+
+
+# ---------- 全市场近 N 日行情快照（Tushare daily by trade_date）----------
+
+_MARKET_WINDOW_CACHE: Optional[pd.DataFrame] = None
+_MARKET_WINDOW_TRIED = False
+
+
+def fetch_market_window(days: int = 6, use_mock: bool = False) -> Optional[pd.DataFrame]:
+    """近 days 个交易日的全市场行情，用于行业择强 + 个股趋势排序。
+
+    数据组织：每只股票一行，字段含 ts_code, code (6位), close_now (最新收盘),
+    chg_5d (5 日累计涨幅 %), amount_now (最新成交额 千元)。
+
+    Tushare daily(trade_date=...) 一次返回 5500 只全市场，6 次调用 ≈ 6 秒。
+    50 次/分钟限速绰绰有余。
+    """
+    global _MARKET_WINDOW_CACHE, _MARKET_WINDOW_TRIED
+    if _MARKET_WINDOW_TRIED:
+        return _MARKET_WINDOW_CACHE
+    _MARKET_WINDOW_TRIED = True
+
+    if use_mock:
+        # mock 用 spot CSV 凑出近似窗口
+        spot = _mock_spot()
+        rows = []
+        for _, r in spot.iterrows():
+            code = str(r["代码"]).zfill(6)
+            close = float(r["最新价"])
+            # 假设 5 日累计 = 当日涨跌幅 × 4（粗略 mock）
+            chg_5d = float(r.get("涨跌幅", 0)) * 4
+            rows.append({
+                "ts_code": _to_ts_code(code), "code": code,
+                "close_now": close, "chg_5d": chg_5d,
+                "amount_now": float(r.get("成交额", 0)) / 1000,
+            })
+        _MARKET_WINDOW_CACHE = pd.DataFrame(rows)
+        return _MARKET_WINDOW_CACHE
+
+    pro = get_tushare()
+    if pro is None:
+        return None
+
+    # 拉取近 days*2 个自然日内的所有交易日数据，确保拿到 days 个有效交易日
+    daily_frames: list[pd.DataFrame] = []
+    last_err = None
+    offset = 1  # 从昨天开始（今天可能还没收盘）
+    while len(daily_frames) < days and offset <= days * 2 + 5:
+        d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
+        offset += 1
+        try:
+            df = pro.daily(trade_date=d)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            msg = str(e)
+            if "频率" in msg or "频次" in msg:
+                print(f"   ⚠️  Tushare daily 限速,放弃: {e}")
+                return None
+            print(f"   ⚠️  Tushare daily {d} 失败: {e}")
+            continue
+        if df is not None and not df.empty:
+            daily_frames.append(df)
+
+    if len(daily_frames) < 2:
+        print(f"   ⚠️  Tushare 全市场窗口数据不足 (got {len(daily_frames)}, last_err={last_err})")
+        return None
+
+    # 由近到远排：daily_frames[0] 是最新交易日
+    latest = daily_frames[0]
+    earliest = daily_frames[-1]
+    print(f"   ✅ Tushare 全市场窗口: {earliest['trade_date'].iloc[0]} → {latest['trade_date'].iloc[0]} ({len(daily_frames)} 个交易日)")
+
+    # 用最新一天 + 最早一天计算累计涨幅
+    merged = latest[["ts_code", "close", "amount"]].rename(
+        columns={"close": "close_now", "amount": "amount_now"}
+    ).merge(
+        earliest[["ts_code", "close"]].rename(columns={"close": "close_start"}),
+        on="ts_code", how="inner",
+    )
+    merged["chg_5d"] = (merged["close_now"] - merged["close_start"]) / merged["close_start"] * 100
+    # 6 位 code（去掉 .SH/.SZ/.BJ）
+    merged["code"] = merged["ts_code"].astype(str).str.split(".").str[0]
+    _MARKET_WINDOW_CACHE = merged[["ts_code", "code", "close_now", "chg_5d", "amount_now"]]
+    return _MARKET_WINDOW_CACHE
