@@ -29,41 +29,42 @@ def _make_kline(n: int, trend: float = 0.4, vol_boost: bool = True) -> pd.DataFr
     )
 
 
+# ---------- 趋势/量能/动量/安全（沿用旧用例,数值改为新权重） ----------
+
+
 def test_trend_bullish():
     kl = _make_kline(60, trend=0.4)
     s = scoring.score_trend(kl["收盘"])
-    assert s == 30.0, f"多头排列应满分 30，实得 {s}"
+    assert s == 22.0, f"多头排列应满分 22，实得 {s}"
 
 
 def test_trend_bearish():
     kl = _make_kline(60, trend=-0.4)
     s = scoring.score_trend(kl["收盘"])
-    assert s < 30, f"空头不应满分，实得 {s}"
+    assert s < 22, f"空头不应满分，实得 {s}"
 
 
 def test_volume_boost():
     kl = _make_kline(60, vol_boost=True)
     s = scoring.score_volume(kl["成交量"])
-    assert s > 20, f"放量应高分，实得 {s}"
+    assert s > 14, f"放量应高分 (>14/18)，实得 {s}"
 
 
 def test_volume_flat():
     kl = _make_kline(60, vol_boost=False)
     s = scoring.score_volume(kl["成交量"])
-    assert 10 <= s <= 15, f"平量应中性 12.5 附近，实得 {s}"
+    assert 7 <= s <= 11, f"平量应中性 9 附近，实得 {s}"
 
 
 def test_rsi_normal_range():
-    # 带回调的温和上涨，RSI 应在 50-70 区间
     np.random.seed(7)
     n = 60
     closes = pd.Series(np.linspace(50, 60, n) + np.random.normal(0, 1.5, n))
     s = scoring.score_momentum(closes)
-    assert s in (20.0, 10.0), f"温和上涨(带回调) RSI 应在中高区间，实得 {s}"
+    assert s in (12.0, 6.0), f"温和上涨 RSI 应在中高区间，实得 {s}"
 
 
 def test_rsi_overbought_zero():
-    # 单调暴涨 RSI=100,应该 0 分(避免追高)
     closes = pd.Series(np.linspace(50, 80, 60))
     s = scoring.score_momentum(closes)
     assert s == 0.0, f"严重超买应 0 分，实得 {s}"
@@ -72,18 +73,115 @@ def test_rsi_overbought_zero():
 def test_safety_close_to_ma60():
     closes = pd.Series([50.0] * 60)
     s = scoring.score_safety(closes)
-    assert s == 10.0, f"贴线应满分，实得 {s}"
+    assert s == 8.0, f"贴线应满分 8，实得 {s}"
 
 
 def test_safety_far_above_ma60():
     closes = pd.Series([50.0] * 30 + [80.0] * 30)
     s = scoring.score_safety(closes)
-    assert s < 5, f"严重偏离应低分，实得 {s}"
+    assert s < 4, f"严重偏离应低分，实得 {s}"
+
+
+# ---------- 资金/换手 ----------
+
+
+def test_fund_north_positive():
+    s = scoring.score_fund(north_change=2.5)
+    assert s == 10.0, f"+2.5%北向应满分 10，实得 {s}"
+
+
+def test_fund_north_negative():
+    s = scoring.score_fund(north_change=-1.0)
+    assert s == 0.0, f"北向流出应 0 分，实得 {s}"
+
+
+def test_fund_neutral():
+    s = scoring.score_fund(north_change=None, north_market_flow=None)
+    assert s == 5.0, f"无数据应中性 5，实得 {s}"
+
+
+def test_turnover_healthy():
+    assert scoring.score_turnover(2.0) == 5.0
+
+
+def test_turnover_overhot():
+    assert scoring.score_turnover(15.0) == 0.0
+
+
+# ---------- 新因子：涨停 / 估值 / 龙虎 / 财务 ----------
+
+
+def test_limit_up_3_times_with_streak():
+    s = scoring.score_limit_up(limit_times_10d=3, max_streak=2)
+    assert s == 10.0, f"3次涨停+连板应满分,实得 {s}"
+
+
+def test_limit_up_1_time():
+    s = scoring.score_limit_up(limit_times_10d=1, max_streak=1)
+    assert s == 4.0, f"1次涨停应 4,实得 {s}"
+
+
+def test_limit_up_none():
+    s = scoring.score_limit_up(0, 0)
+    assert s == 0.0
+
+
+def test_valuation_low():
+    s = scoring.score_valuation(pe_ttm=12, pb=1.5)
+    assert s == 10.0, f"低估值应满分 10,实得 {s}"
+
+
+def test_valuation_high():
+    s = scoring.score_valuation(pe_ttm=80, pb=15)
+    assert s == 0.0
+
+
+def test_valuation_loss_company():
+    """亏损股 PE<0,PB 正常的情况。"""
+    s = scoring.score_valuation(pe_ttm=-5, pb=1.5)
+    assert s == 5.0, f"亏损但 PB 低应得 PB 分,实得 {s}"
+
+
+def test_valuation_no_data():
+    s = scoring.score_valuation(None, None)
+    assert s == 5.0
+
+
+def test_longhu_neutral_when_no_perm():
+    s = scoring.score_longhu(longhu_active=None)
+    assert s == 2.5, "无权限时应中性 2.5"
+
+
+def test_longhu_active():
+    assert scoring.score_longhu(True) == 5.0
+    assert scoring.score_longhu(False) == 0.0
+
+
+def test_finance_neutral_when_no_perm():
+    s = scoring.score_finance(roe=None, profit_growth=None)
+    assert s == 2.5
+
+
+def test_finance_excellent():
+    s = scoring.score_finance(roe=20, profit_growth=30)
+    assert s == 5.0, f"优秀财务应满分 5,实得 {s}"
+
+
+def test_finance_negative():
+    s = scoring.score_finance(roe=-5, profit_growth=-10)
+    assert s == 0.0
+
+
+# ---------- 集成 ----------
 
 
 def test_score_one_integration():
     kl = _make_kline(60, trend=0.4, vol_boost=True)
-    score = scoring.score_one("000001", "测试", "测试板块", kl, north_change=2.0)
+    score = scoring.score_one(
+        "000001", "测试", "测试板块", kl, north_change=2.0,
+        turnover_rate=2.0, limit_times_10d=1, max_streak=1,
+        pe_ttm=20, pb=2.0,
+    )
     assert score is not None
     assert score.total > 50, f"健康 K 线综合分应 >50，实得 {score.total}"
     assert score.suggested_stop_loss < score.last_close
@@ -97,9 +195,25 @@ def test_score_one_insufficient_data():
 
 def test_score_total_in_range():
     kl = _make_kline(60)
-    score = scoring.score_one("000001", "test", "ind", kl, north_change=5.0)
+    score = scoring.score_one(
+        "000001", "test", "ind", kl, north_change=5.0,
+        turnover_rate=2.0, limit_times_10d=2, max_streak=1,
+        pe_ttm=18, pb=1.8,
+    )
     assert score is not None
-    assert 0 <= score.total <= 110, f"总分（含换手率）应在 0-110，实得 {score.total}"
+    assert 0 <= score.total <= 100, f"总分应在 0-100，实得 {score.total}"
+
+
+def test_score_one_returns_all_dimensions():
+    kl = _make_kline(60, trend=0.4, vol_boost=True)
+    score = scoring.score_one(
+        "000001", "测试", "板块", kl, north_change=1.0,
+        turnover_rate=2.0,
+    )
+    d = score.as_dict()
+    for k in ("trend", "volume", "momentum", "fund", "safety", "turnover",
+              "limit_up", "valuation", "longhu", "finance", "total"):
+        assert k in d, f"as_dict 缺字段 {k}"
 
 
 if __name__ == "__main__":
