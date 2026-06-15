@@ -1,4 +1,7 @@
-"""数据加载层：封装 akshare 接口，统一加 timeout + 重试 + 缓存。
+"""数据加载层：封装 akshare + Tushare 双通道。
+
+- akshare：海外 runner 上 spot/kline 走新浪 fallback 还能用，板块/北向/财务全废
+- Tushare：海外稳定，但免费 100 积分有接口权限和限速限制，按"全市场每日拉一次"使用
 
 所有对外暴露的函数都带 use_mock 参数，dry-run 时返回内置模拟数据。
 """
@@ -6,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import io
+import os
 import time
 import warnings
 from datetime import datetime, timedelta
@@ -35,6 +39,57 @@ def _retry(times: int = 3, delay: float = 1.5):
         return wrapper
 
     return deco
+
+
+# ---------- Tushare 单例 ----------
+
+_TS_PRO = None
+_TS_INIT_TRIED = False
+
+
+def get_tushare():
+    """返回 tushare pro_api 实例；token 不存在时返回 None。"""
+    global _TS_PRO, _TS_INIT_TRIED
+    if _TS_INIT_TRIED:
+        return _TS_PRO
+    _TS_INIT_TRIED = True
+    token = os.environ.get("TUSHARE_TOKEN")
+    if not token:
+        return None
+    try:
+        import tushare as ts
+
+        ts.set_token(token)
+        _TS_PRO = ts.pro_api()
+        return _TS_PRO
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  Tushare 初始化失败: {e}")
+        return None
+
+
+def _to_ts_code(code: str) -> str:
+    """6 位代码 → ts_code 格式（600519.SH / 000001.SZ）。"""
+    code = str(code).zfill(6)
+    if code.startswith(("6", "9")):
+        return f"{code}.SH"
+    if code.startswith("4") or code.startswith("8") or code.startswith("92"):
+        return f"{code}.BJ"
+    return f"{code}.SZ"
+
+
+def _last_trade_date_str() -> str:
+    """返回上一个工作日的 YYYYMMDD（够用做 trade_date 默认值）。"""
+    d = datetime.now().date()
+    # 周一往前找到周五；周日找周五；周六找周五
+    if d.weekday() == 0:
+        d = d - timedelta(days=3)
+    elif d.weekday() == 6:
+        d = d - timedelta(days=2)
+    elif d.weekday() == 5:
+        d = d - timedelta(days=1)
+    else:
+        d = d - timedelta(days=1)
+    return d.strftime("%Y%m%d")
 
 
 # ---------- mock 数据（dry-run 用） ----------
@@ -153,9 +208,42 @@ def fetch_spot(use_mock: bool = False) -> pd.DataFrame:
 
 @_retry()
 def fetch_kline(code: str, days: int = 60, use_mock: bool = False) -> pd.DataFrame:
-    """单只股票日线。优先东方财富，失败回退新浪。"""
+    """单只股票日线。优先 Tushare，失败回退东方财富，再回退新浪。
+
+    Tushare daily 接口海外稳定且无限速（仅有总积分限制），是首选。
+    """
     if use_mock:
         return _mock_kline(code, days)
+
+    # 优先 Tushare
+    pro = get_tushare()
+    if pro is not None:
+        try:
+            ts_code = _to_ts_code(code)
+            end = datetime.now().strftime("%Y%m%d")
+            start = (datetime.now() - timedelta(days=days * 2 + 30)).strftime("%Y%m%d")
+            df = pro.daily(ts_code=ts_code, start_date=start, end_date=end)
+            if df is not None and not df.empty:
+                # Tushare 返回按日期倒序，转为正序
+                df = df.sort_values("trade_date").reset_index(drop=True)
+                df = df.rename(columns={
+                    "trade_date": "日期",
+                    "open": "开盘",
+                    "high": "最高",
+                    "low": "最低",
+                    "close": "收盘",
+                    "vol": "成交量",
+                    "amount": "成交额",
+                })
+                df["日期"] = pd.to_datetime(df["日期"])
+                # Tushare vol 单位是手，amount 是千元，按内部惯例对齐到 akshare 的"股/元"
+                df["成交量"] = df["成交量"] * 100
+                df["成交额"] = df["成交额"] * 1000
+                return df.tail(days).reset_index(drop=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"   ⚠️  Tushare daily 失败 {code}: {e}, 回退 akshare")
+
+    # akshare 东方财富
     import akshare as ak
 
     end = datetime.now().strftime("%Y%m%d")
@@ -188,6 +276,7 @@ def fetch_industry_rank(top_n: int = 5, use_mock: bool = False) -> pd.DataFrame:
 
     海外环境下东方财富板块接口经常被拒，失败时返回空 DataFrame，
     上层逻辑会改用 spot 全市场作为候选池。
+    Tushare index_classify 需要 2000 积分，免费版不可用。
     """
     if use_mock:
         return _mock_industry_top(top_n)
@@ -238,13 +327,154 @@ def is_trading_day(use_mock: bool = False) -> bool:
         return datetime.now().weekday() < 5
 
 
+# ---------- Tushare 全市场批量缓存 ----------
+# 这些接口免费版限速 1 次/小时,但单次拉全市场,主流程整轮只调一次
+
+_HK_HOLD_CACHE: Optional[pd.DataFrame] = None
+_DAILY_BASIC_CACHE: Optional[pd.DataFrame] = None
+_LIMIT_LIST_CACHE: Optional[pd.DataFrame] = None
+
+
+def fetch_hk_hold_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
+    """全市场北向持股（最近 10 个交易日），按 ts_code 索引。
+
+    返回 DataFrame 包含 ts_code 和最近 5 日持股变动百分比；
+    上层用 code -> 变动百分比的字典消费。
+    """
+    global _HK_HOLD_CACHE
+    if _HK_HOLD_CACHE is not None:
+        return _HK_HOLD_CACHE
+    if use_mock:
+        # mock: 给若干代码生成一个模拟的 5 日持股变动
+        import random
+        rows = []
+        for code in ["600519.SH", "000858.SZ", "300750.SZ", "002594.SZ"]:
+            random.seed(hash(code) & 0xffff)
+            rows.append({"ts_code": code, "north_5d_change": random.uniform(-2, 4)})
+        _HK_HOLD_CACHE = pd.DataFrame(rows)
+        return _HK_HOLD_CACHE
+    pro = get_tushare()
+    if pro is None:
+        return None
+    try:
+        # 拉最近 10 个自然日窗口的全市场北向持股
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d")
+        df = pro.hk_hold(start_date=start, end_date=end)
+        if df is None or df.empty:
+            print("   ⚠️  Tushare hk_hold 返回空")
+            return None
+        # 按 ts_code 取最早和最新两个交易日的 vol（持股数），算变化百分比
+        df = df.sort_values(["ts_code", "trade_date"])
+        agg = df.groupby("ts_code").agg(
+            first_vol=("vol", "first"),
+            last_vol=("vol", "last"),
+        ).reset_index()
+        agg["north_5d_change"] = (agg["last_vol"] - agg["first_vol"]) / agg["first_vol"].replace(0, pd.NA) * 100
+        _HK_HOLD_CACHE = agg[["ts_code", "north_5d_change"]].dropna()
+        print(f"   ✅ Tushare hk_hold 全市场 {len(_HK_HOLD_CACHE)} 只")
+        return _HK_HOLD_CACHE
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  Tushare hk_hold 失败: {e}")
+        return None
+
+
+def fetch_daily_basic_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
+    """全市场基本面快照（PE / PB / 换手率 / 总市值），按上一个交易日。"""
+    global _DAILY_BASIC_CACHE
+    if _DAILY_BASIC_CACHE is not None:
+        return _DAILY_BASIC_CACHE
+    if use_mock:
+        rows = []
+        for code in ["600519.SH", "000858.SZ", "300750.SZ", "002594.SZ"]:
+            rows.append({"ts_code": code, "pe_ttm": 25.0, "pb": 4.0,
+                         "turnover_rate": 1.5, "total_mv": 5e9})
+        _DAILY_BASIC_CACHE = pd.DataFrame(rows)
+        return _DAILY_BASIC_CACHE
+    pro = get_tushare()
+    if pro is None:
+        return None
+    try:
+        # 全市场单次拉取最近一个交易日
+        for offset in range(0, 7):
+            d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
+            try:
+                df = pro.daily_basic(trade_date=d, fields="ts_code,pe_ttm,pb,turnover_rate,total_mv,circ_mv")
+            except Exception:
+                df = None
+            if df is not None and not df.empty:
+                _DAILY_BASIC_CACHE = df
+                print(f"   ✅ Tushare daily_basic {d} 全市场 {len(df)} 只")
+                return _DAILY_BASIC_CACHE
+        print("   ⚠️  Tushare daily_basic 7 天内无数据")
+        return None
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  Tushare daily_basic 失败: {e}")
+        return None
+
+
+def fetch_limit_list_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
+    """近 10 个交易日全市场涨停列表（汇总每只代码的涨停次数 + 最高连板数）。"""
+    global _LIMIT_LIST_CACHE
+    if _LIMIT_LIST_CACHE is not None:
+        return _LIMIT_LIST_CACHE
+    if use_mock:
+        rows = [
+            {"ts_code": "300750.SZ", "limit_times_10d": 2, "max_streak": 1},
+            {"ts_code": "300059.SZ", "limit_times_10d": 3, "max_streak": 2},
+        ]
+        _LIMIT_LIST_CACHE = pd.DataFrame(rows)
+        return _LIMIT_LIST_CACHE
+    pro = get_tushare()
+    if pro is None:
+        return None
+    try:
+        # 注意:limit_list_d 的 limit_type=U 是涨停板,只能按 trade_date 拉一天
+        # 免费版 1 次/小时,这里只能拉 1 天作为"近期热度"代表
+        # 拿最近一个交易日;如果空,往前找
+        for offset in range(0, 7):
+            d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
+            try:
+                df = pro.limit_list_d(trade_date=d, limit_type="U")
+            except Exception:
+                df = None
+            if df is not None and not df.empty:
+                # 按 ts_code 聚合
+                agg = df.groupby("ts_code").agg(
+                    limit_times_10d=("ts_code", "count"),
+                    max_streak=("limit_times", "max") if "limit_times" in df.columns else ("ts_code", "count"),
+                ).reset_index()
+                _LIMIT_LIST_CACHE = agg
+                print(f"   ✅ Tushare limit_list_d {d} 涨停 {len(agg)} 只")
+                return _LIMIT_LIST_CACHE
+        print("   ⚠️  Tushare limit_list_d 7 天内无数据")
+        return None
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  Tushare limit_list_d 失败: {e}")
+        return None
+
+
 def fetch_north_flow(code: str, use_mock: bool = False) -> Optional[float]:
-    """近 5 日北向持股变动百分比，失败返回 None。"""
+    """单只股票近 5 日北向持股变动百分比，失败返回 None。
+
+    优先用全市场缓存（Tushare hk_hold），失败回退 akshare 个股查询。
+    """
     if use_mock:
         import random
 
         random.seed(int(code[-3:]) if code[-3:].isdigit() else 0)
         return random.uniform(-2, 4)
+
+    # 优先走 Tushare 全市场缓存
+    cache = fetch_hk_hold_market(use_mock=False)
+    if cache is not None and not cache.empty:
+        ts_code = _to_ts_code(code)
+        row = cache[cache["ts_code"] == ts_code]
+        if not row.empty:
+            return float(row.iloc[0]["north_5d_change"])
+        return None  # Tushare 有数据但这只不在内,大概率不是港股通标的
+
+    # 回退 akshare 个股
     try:
         import akshare as ak
 
@@ -260,3 +490,50 @@ def fetch_north_flow(code: str, use_mock: bool = False) -> Optional[float]:
         return float(recent.iloc[-1] - recent.iloc[0])
     except Exception:
         return None
+
+
+def get_stock_factors(code: str, use_mock: bool = False) -> dict:
+    """汇总单只股票的新因子数据：PE/PB/换手率 + 涨停次数 + 北向变动。
+
+    所有数据都来自全市场缓存,首次调用时触发拉取,之后 O(1) 查询。
+    返回字典中字段缺失时为 None。
+    """
+    ts_code = _to_ts_code(code)
+    out: dict = {
+        "pe_ttm": None,
+        "pb": None,
+        "turnover_rate": None,
+        "total_mv": None,
+        "limit_times_10d": 0,
+        "max_streak": 0,
+        "north_5d_change": None,
+    }
+    db = fetch_daily_basic_market(use_mock=use_mock)
+    if db is not None:
+        row = db[db["ts_code"] == ts_code]
+        if not row.empty:
+            r = row.iloc[0]
+            for k in ("pe_ttm", "pb", "turnover_rate", "total_mv"):
+                if k in r and pd.notna(r[k]):
+                    out[k] = float(r[k])
+    ll = fetch_limit_list_market(use_mock=use_mock)
+    if ll is not None:
+        row = ll[ll["ts_code"] == ts_code]
+        if not row.empty:
+            r = row.iloc[0]
+            out["limit_times_10d"] = int(r.get("limit_times_10d", 0) or 0)
+            out["max_streak"] = int(r.get("max_streak", 0) or 0)
+    hk = fetch_hk_hold_market(use_mock=use_mock)
+    if hk is not None:
+        row = hk[hk["ts_code"] == ts_code]
+        if not row.empty:
+            out["north_5d_change"] = float(row.iloc[0]["north_5d_change"])
+    return out
+
+
+def _reset_caches_for_test():
+    """单元测试用：重置全市场缓存。"""
+    global _HK_HOLD_CACHE, _DAILY_BASIC_CACHE, _LIMIT_LIST_CACHE
+    _HK_HOLD_CACHE = None
+    _DAILY_BASIC_CACHE = None
+    _LIMIT_LIST_CACHE = None
