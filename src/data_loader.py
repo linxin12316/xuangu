@@ -329,10 +329,14 @@ def is_trading_day(use_mock: bool = False) -> bool:
 
 # ---------- Tushare 全市场批量缓存 ----------
 # 这些接口免费版限速 1 次/小时,但单次拉全市场,主流程整轮只调一次
+# 失败时也要记住"试过了",避免被 200 只股票反复触发限速
 
 _HK_HOLD_CACHE: Optional[pd.DataFrame] = None
+_HK_HOLD_TRIED = False
 _DAILY_BASIC_CACHE: Optional[pd.DataFrame] = None
+_DAILY_BASIC_TRIED = False
 _LIMIT_LIST_CACHE: Optional[pd.DataFrame] = None
+_LIMIT_LIST_TRIED = False
 
 
 def fetch_hk_hold_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
@@ -341,9 +345,10 @@ def fetch_hk_hold_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
     返回 DataFrame 包含 ts_code 和最近 5 日持股变动百分比；
     上层用 code -> 变动百分比的字典消费。
     """
-    global _HK_HOLD_CACHE
-    if _HK_HOLD_CACHE is not None:
+    global _HK_HOLD_CACHE, _HK_HOLD_TRIED
+    if _HK_HOLD_TRIED:
         return _HK_HOLD_CACHE
+    _HK_HOLD_TRIED = True
     if use_mock:
         # mock: 给若干代码生成一个模拟的 5 日持股变动
         import random
@@ -381,9 +386,10 @@ def fetch_hk_hold_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
 
 def fetch_daily_basic_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
     """全市场基本面快照（PE / PB / 换手率 / 总市值），按上一个交易日。"""
-    global _DAILY_BASIC_CACHE
-    if _DAILY_BASIC_CACHE is not None:
+    global _DAILY_BASIC_CACHE, _DAILY_BASIC_TRIED
+    if _DAILY_BASIC_TRIED:
         return _DAILY_BASIC_CACHE
+    _DAILY_BASIC_TRIED = True
     if use_mock:
         rows = []
         for code in ["600519.SH", "000858.SZ", "300750.SZ", "002594.SZ"]:
@@ -394,30 +400,35 @@ def fetch_daily_basic_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
     pro = get_tushare()
     if pro is None:
         return None
-    try:
-        # 全市场单次拉取最近一个交易日
-        for offset in range(0, 7):
-            d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
-            try:
-                df = pro.daily_basic(trade_date=d, fields="ts_code,pe_ttm,pb,turnover_rate,total_mv,circ_mv")
-            except Exception:
-                df = None
+    # 全市场单次拉取最近一个交易日;遇到限速立即停止避免被 ban
+    last_err = None
+    for offset in range(1, 8):  # 从昨天开始（今天通常无数据）
+        d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
+        try:
+            df = pro.daily_basic(trade_date=d, fields="ts_code,pe_ttm,pb,turnover_rate,total_mv,circ_mv")
             if df is not None and not df.empty:
                 _DAILY_BASIC_CACHE = df
                 print(f"   ✅ Tushare daily_basic {d} 全市场 {len(df)} 只")
                 return _DAILY_BASIC_CACHE
-        print("   ⚠️  Tushare daily_basic 7 天内无数据")
-        return None
-    except Exception as e:  # noqa: BLE001
-        print(f"   ⚠️  Tushare daily_basic 失败: {e}")
-        return None
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            msg = str(e)
+            if "频率" in msg or "频次" in msg:
+                print(f"   ⚠️  Tushare daily_basic 限速,放弃: {e}")
+                return None
+            # 其它错误（无权限、网络）也直接退出
+            print(f"   ⚠️  Tushare daily_basic 失败: {e}")
+            return None
+    print(f"   ⚠️  Tushare daily_basic 7 天内无数据 (last={last_err})")
+    return None
 
 
 def fetch_limit_list_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
     """近 10 个交易日全市场涨停列表（汇总每只代码的涨停次数 + 最高连板数）。"""
-    global _LIMIT_LIST_CACHE
-    if _LIMIT_LIST_CACHE is not None:
+    global _LIMIT_LIST_CACHE, _LIMIT_LIST_TRIED
+    if _LIMIT_LIST_TRIED:
         return _LIMIT_LIST_CACHE
+    _LIMIT_LIST_TRIED = True
     if use_mock:
         rows = [
             {"ts_code": "300750.SZ", "limit_times_10d": 2, "max_streak": 1},
@@ -428,30 +439,31 @@ def fetch_limit_list_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
     pro = get_tushare()
     if pro is None:
         return None
-    try:
-        # 注意:limit_list_d 的 limit_type=U 是涨停板,只能按 trade_date 拉一天
-        # 免费版 1 次/小时,这里只能拉 1 天作为"近期热度"代表
-        # 拿最近一个交易日;如果空,往前找
-        for offset in range(0, 7):
-            d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
-            try:
-                df = pro.limit_list_d(trade_date=d, limit_type="U")
-            except Exception:
-                df = None
+    last_err = None
+    for offset in range(1, 8):
+        d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
+        try:
+            df = pro.limit_list_d(trade_date=d, limit_type="U")
             if df is not None and not df.empty:
                 # 按 ts_code 聚合
+                streak_col = "limit_times" if "limit_times" in df.columns else "ts_code"
                 agg = df.groupby("ts_code").agg(
                     limit_times_10d=("ts_code", "count"),
-                    max_streak=("limit_times", "max") if "limit_times" in df.columns else ("ts_code", "count"),
+                    max_streak=(streak_col, "max"),
                 ).reset_index()
                 _LIMIT_LIST_CACHE = agg
                 print(f"   ✅ Tushare limit_list_d {d} 涨停 {len(agg)} 只")
                 return _LIMIT_LIST_CACHE
-        print("   ⚠️  Tushare limit_list_d 7 天内无数据")
-        return None
-    except Exception as e:  # noqa: BLE001
-        print(f"   ⚠️  Tushare limit_list_d 失败: {e}")
-        return None
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            msg = str(e)
+            if "频率" in msg or "频次" in msg:
+                print(f"   ⚠️  Tushare limit_list_d 限速,放弃: {e}")
+                return None
+            print(f"   ⚠️  Tushare limit_list_d 失败: {e}")
+            return None
+    print(f"   ⚠️  Tushare limit_list_d 7 天内无数据 (last={last_err})")
+    return None
 
 
 def fetch_north_flow(code: str, use_mock: bool = False) -> Optional[float]:
@@ -534,6 +546,10 @@ def get_stock_factors(code: str, use_mock: bool = False) -> dict:
 def _reset_caches_for_test():
     """单元测试用：重置全市场缓存。"""
     global _HK_HOLD_CACHE, _DAILY_BASIC_CACHE, _LIMIT_LIST_CACHE
+    global _HK_HOLD_TRIED, _DAILY_BASIC_TRIED, _LIMIT_LIST_TRIED
     _HK_HOLD_CACHE = None
     _DAILY_BASIC_CACHE = None
     _LIMIT_LIST_CACHE = None
+    _HK_HOLD_TRIED = False
+    _DAILY_BASIC_TRIED = False
+    _LIMIT_LIST_TRIED = False
