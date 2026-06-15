@@ -111,19 +111,32 @@ def test_turnover_overhot():
 # ---------- 新因子：涨停 / 估值 / 龙虎 / 财务 ----------
 
 
-def test_limit_up_3_times_with_streak():
-    s = scoring.score_limit_up(limit_times_10d=3, max_streak=2)
-    assert s == 10.0, f"3次涨停+连板应满分,实得 {s}"
+def test_limit_up_4_streak_max():
+    s = scoring.score_limit_up(zt_streak=4)
+    assert s == 10.0, f"4连板应满分10,实得 {s}"
 
 
-def test_limit_up_1_time():
-    s = scoring.score_limit_up(limit_times_10d=1, max_streak=1)
-    assert s == 4.0, f"1次涨停应 4,实得 {s}"
+def test_limit_up_3_streak():
+    assert scoring.score_limit_up(zt_streak=3) == 8.0
+
+
+def test_limit_up_2_streak():
+    assert scoring.score_limit_up(zt_streak=2) == 6.0
+
+
+def test_limit_up_1_streak():
+    """昨日刚涨停 → 4 分。"""
+    assert scoring.score_limit_up(zt_streak=1) == 4.0
+
+
+def test_limit_up_recent_only():
+    """近 7 日有涨停但昨日未涨停 → 2 分。"""
+    s = scoring.score_limit_up(zt_streak=0, limit_times_10d=2)
+    assert s == 2.0
 
 
 def test_limit_up_none():
-    s = scoring.score_limit_up(0, 0)
-    assert s == 0.0
+    assert scoring.score_limit_up(zt_streak=0, limit_times_10d=0) == 0.0
 
 
 def test_valuation_low():
@@ -147,14 +160,23 @@ def test_valuation_no_data():
     assert s == 5.0
 
 
-def test_longhu_neutral_when_no_perm():
-    s = scoring.score_longhu(longhu_active=None)
-    assert s == 2.5, "无权限时应中性 2.5"
+def test_longhu_no_data_neutral():
+    s = scoring.score_longhu(lhb_net_buy=None)
+    assert s == 2.5, "未上榜/数据缺失应中性 2.5"
 
 
-def test_longhu_active():
-    assert scoring.score_longhu(True) == 5.0
-    assert scoring.score_longhu(False) == 0.0
+def test_longhu_big_buy():
+    """上榜+大额净买入 → 满分 5。"""
+    assert scoring.score_longhu(lhb_net_buy=1e8) == 5.0
+
+
+def test_longhu_small_buy():
+    assert scoring.score_longhu(lhb_net_buy=1e6) == 4.0
+
+
+def test_longhu_net_sell():
+    """上榜+净卖出 → 0 (常预示出货)。"""
+    assert scoring.score_longhu(lhb_net_buy=-1e6) == 0.0
 
 
 def test_finance_neutral_when_no_perm():
@@ -179,8 +201,7 @@ def test_score_one_integration():
     kl = _make_kline(60, trend=0.4, vol_boost=True)
     score = scoring.score_one(
         "000001", "测试", "测试板块", kl, north_change=2.0,
-        turnover_rate=2.0, limit_times_10d=1, max_streak=1,
-        pe_ttm=20, pb=2.0,
+        turnover_rate=2.0, zt_streak=1, pe_ttm=20, pb=2.0,
     )
     assert score is not None
     assert score.total > 50, f"健康 K 线综合分应 >50，实得 {score.total}"
@@ -197,7 +218,7 @@ def test_score_total_in_range():
     kl = _make_kline(60)
     score = scoring.score_one(
         "000001", "test", "ind", kl, north_change=5.0,
-        turnover_rate=2.0, limit_times_10d=2, max_streak=1,
+        turnover_rate=2.0, zt_streak=2,
         pe_ttm=18, pb=1.8,
     )
     assert score is not None
