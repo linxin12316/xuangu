@@ -15,7 +15,7 @@
     "longhu": 2.5,
     "finance": 2.5,
     "last_close": 7.41,
-    "suggested_stop_loss": 7.05
+    "suggested_stop_loss": 7.04
   },
   {
     "code": "000823",
@@ -54,24 +54,6 @@
     "suggested_stop_loss": 12.11
   },
   {
-    "code": "301128",
-    "name": "强瑞技术",
-    "industry": "全市场",
-    "total": 78.9,
-    "trend": 22.0,
-    "volume": 14.4,
-    "momentum": 12.0,
-    "fund": 10.0,
-    "safety": 8.0,
-    "turnover": 2.5,
-    "limit_up": 0.0,
-    "valuation": 5.0,
-    "longhu": 2.5,
-    "finance": 2.5,
-    "last_close": 163.89,
-    "suggested_stop_loss": 152.42
-  },
-  {
     "code": "600549",
     "name": "厦门钨业",
     "industry": "全市场",
@@ -88,5 +70,23 @@
     "finance": 2.5,
     "last_close": 64.8,
     "suggested_stop_loss": 60.26
+  },
+  {
+    "code": "603328",
+    "name": "依顿电子",
+    "industry": "全市场",
+    "total": 78.5,
+    "trend": 22.0,
+    "volume": 14.0,
+    "momentum": 12.0,
+    "fund": 10.0,
+    "safety": 8.0,
+    "turnover": 2.5,
+    "limit_up": 0.0,
+    "valuation": 5.0,
+    "longhu": 2.5,
+    "finance": 2.5,
+    "last_close": 13.38,
+    "suggested_stop_loss": 12.77
   }
 ]
