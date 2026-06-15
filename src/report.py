@@ -23,6 +23,10 @@ def render_pick_report(
     risk_score: int | None = None,
     risk_desc: str | None = None,
     north_flow: float | None = None,
+    concept_fundflow: pd.DataFrame | None = None,
+    industry_fundflow: pd.DataFrame | None = None,
+    zt_pool: pd.DataFrame | None = None,
+    lhb_detail: pd.DataFrame | None = None,
 ) -> str:
     streak_map = streak_map or {}
     today = datetime.now().strftime("%Y-%m-%d")
@@ -70,8 +74,90 @@ def render_pick_report(
     lines.append("")
 
     lines.append("*总分满分 100（趋势22+量能18+动量12+资金10+安全8+换手5+涨停10+估值10+龙虎5+财务5）*")
-    lines.append("*龙虎榜/财务因子需 Tushare 2000 积分接口，当前免费版给中性 2.5 分*")
+    lines.append("*财务因子需 Tushare 2000 积分接口，当前免费版给中性 2.5 分*")
     lines.append("")
+
+    # ---- 新模块: 今日热门概念 ----
+    if concept_fundflow is not None and not concept_fundflow.empty:
+        lines.append("## 💡 今日热门概念（资金净流入 Top 8）")
+        lines.append("")
+        lines.append("| 概念 | 涨幅 | 净流入(亿) | 领涨股 | 领涨股涨幅 |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for _, r in concept_fundflow.head(8).iterrows():
+            try:
+                lines.append(
+                    f"| {r['行业']} | {float(r.get('行业-涨跌幅', 0)):.2f}% | "
+                    f"{float(r.get('净额', 0)):.2f} | {r.get('领涨股', '-')} | "
+                    f"{float(r.get('领涨股-涨跌幅', 0)):.2f}% |"
+                )
+            except (ValueError, TypeError):
+                continue
+        lines.append("")
+
+    # ---- 新模块: 行业资金流（候选池主力来源）----
+    if industry_fundflow is not None and not industry_fundflow.empty:
+        lines.append("## 💰 主力行业流向（资金净流入 Top 6）")
+        lines.append("")
+        lines.append("| 行业 | 涨幅 | 净流入(亿) | 领涨股 |")
+        lines.append("| --- | --- | --- | --- |")
+        for _, r in industry_fundflow.head(6).iterrows():
+            try:
+                lines.append(
+                    f"| {r['行业']} | {float(r.get('行业-涨跌幅', 0)):.2f}% | "
+                    f"{float(r.get('净额', 0)):.2f} | {r.get('领涨股', '-')} |"
+                )
+            except (ValueError, TypeError):
+                continue
+        lines.append("")
+
+    # ---- 新模块: 涨停梯队 ----
+    if zt_pool is not None and not zt_pool.empty:
+        try:
+            zt_pool_sorted = zt_pool.copy()
+            zt_pool_sorted["连板数"] = pd.to_numeric(zt_pool_sorted.get("连板数", 0), errors="coerce").fillna(0).astype(int)
+            high = zt_pool_sorted[zt_pool_sorted["连板数"] >= 2].sort_values("连板数", ascending=False)
+            if not high.empty:
+                lines.append(f"## 🚀 昨日连板梯队（≥2连，共 {len(high)} 只）")
+                lines.append("")
+                lines.append("| 代码 | 名称 | 连板 | 行业 | 换手率 |")
+                lines.append("| --- | --- | --- | --- | --- |")
+                for _, r in high.head(15).iterrows():
+                    try:
+                        lines.append(
+                            f"| {r['代码']} | {r['名称']} | **{int(r['连板数'])}板** | "
+                            f"{r.get('所属行业', '-')} | {float(r.get('换手率', 0)):.2f}% |"
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                lines.append("")
+        except Exception:
+            pass
+
+    # ---- 新模块: 龙虎榜净买 Top 10 ----
+    if lhb_detail is not None and not lhb_detail.empty:
+        try:
+            lhb_sorted = lhb_detail.copy()
+            lhb_sorted["龙虎榜净买额"] = pd.to_numeric(
+                lhb_sorted.get("龙虎榜净买额", 0), errors="coerce"
+            ).fillna(0)
+            # 按代码聚合（同股可能因多个原因上榜多次）
+            agg = lhb_sorted.groupby(["代码", "名称"], as_index=False).agg(
+                净买额=("龙虎榜净买额", "sum"),
+                解读=("解读", "first"),
+            )
+            agg = agg.sort_values("净买额", ascending=False).head(10)
+            if not agg.empty and agg.iloc[0]["净买额"] > 0:
+                lines.append("## 🐯 昨日龙虎榜净买 Top 10")
+                lines.append("")
+                lines.append("| 代码 | 名称 | 净买(万) | 解读 |")
+                lines.append("| --- | --- | --- | --- |")
+                for _, r in agg.iterrows():
+                    nb_wan = r["净买额"] / 1e4
+                    desc = str(r.get("解读", "-"))[:25]
+                    lines.append(f"| {r['代码']} | {r['名称']} | {nb_wan:+.0f} | {desc} |")
+                lines.append("")
+        except Exception:
+            pass
 
     lines.append("## 📋 操作建议")
     lines.append("")
@@ -80,7 +166,7 @@ def render_pick_report(
     lines.append("- 综合分 70 以下的标的优先级降低")
     lines.append("- 同一板块最多同时持有 2 只，避免过度集中")
     lines.append("")
-    lines.append(f"*数据来源：Tushare（K线/北向/估值/涨停）+ akshare（spot/板块）*  \n*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+    lines.append(f"*数据来源：Tushare（K线/北向/估值/资金流）+ akshare（同花顺资金流/涨停池/龙虎榜）*  \n*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
 
     return "\n".join(lines)
 
