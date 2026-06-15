@@ -230,3 +230,152 @@ def render_review_report(
     lines.append("")
     lines.append(f"*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
     return "\n".join(lines)
+
+
+# ---------- 晚间复盘 (18:23) ----------
+
+
+def render_evening_report(
+    picks: Sequence[Score],
+    industries: pd.DataFrame | None = None,
+    concept_ff: pd.DataFrame | None = None,
+    industry_ff: pd.DataFrame | None = None,
+    zt_pool: pd.DataFrame | None = None,
+    lhb_detail: pd.DataFrame | None = None,
+    risk_score: int | None = None,
+    risk_desc: str | None = None,
+    north_flow: float | None = None,
+    streak_map: dict[str, int] | None = None,
+) -> str:
+    """晚间深度复盘：今日盘面总结 + 明日 Top 3 候选（含买点/止损）。"""
+    streak_map = streak_map or {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = [f"# 🌙 晚间复盘 · {today}", "", DISCLAIMER, ""]
+
+    # ---- 今日大盘 ----
+    lines.append("## 📊 今日盘面")
+    lines.append("")
+    if risk_score is not None:
+        if risk_score >= 7:
+            icon = "🟢"
+        elif risk_score >= 5:
+            icon = "🟡"
+        else:
+            icon = "🔴"
+        lines.append(f"- **大盘风险评分**：{icon} {risk_score}/10 — {risk_desc or ''}")
+    if north_flow is not None:
+        lines.append(f"- **北向资金净流入**：{north_flow:+.1f} 亿")
+    lines.append("")
+
+    # ---- 今日热门概念 Top 8 ----
+    if concept_ff is not None and not concept_ff.empty:
+        lines.append("## 💡 今日热门概念（资金净流入 Top 8）")
+        lines.append("")
+        lines.append("| 概念 | 涨幅 | 净流入(亿) | 领涨股 | 领涨涨幅 |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for _, r in concept_ff.head(8).iterrows():
+            try:
+                lines.append(
+                    f"| {r['行业']} | {float(r.get('行业-涨跌幅', 0)):.2f}% | "
+                    f"{float(r.get('净额', 0)):.1f} | {r.get('领涨股', '-')} | "
+                    f"{float(r.get('领涨股-涨跌幅', 0)):.2f}% |"
+                )
+            except (ValueError, TypeError):
+                continue
+        lines.append("")
+
+    # ---- 主力行业流向 Top 6 ----
+    if industry_ff is not None and not industry_ff.empty:
+        lines.append("## 💰 主力行业流向（资金净流入 Top 6）")
+        lines.append("")
+        lines.append("| 行业 | 涨幅 | 净流入(亿) | 领涨股 |")
+        lines.append("| --- | --- | --- | --- |")
+        for _, r in industry_ff.head(6).iterrows():
+            try:
+                lines.append(
+                    f"| {r['行业']} | {float(r.get('行业-涨跌幅', 0)):.2f}% | "
+                    f"{float(r.get('净额', 0)):.1f} | {r.get('领涨股', '-')} |"
+                )
+            except (ValueError, TypeError):
+                continue
+        lines.append("")
+
+    # ---- 今日连板梯队 ----
+    if zt_pool is not None and not zt_pool.empty:
+        try:
+            zp = zt_pool.copy()
+            zp["连板数"] = pd.to_numeric(zp.get("连板数", 0), errors="coerce").fillna(0).astype(int)
+            high = zp[zp["连板数"] >= 2].sort_values("连板数", ascending=False)
+            if not high.empty:
+                lines.append(f"## 🚀 今日连板梯队（≥2连，共 {len(high)} 只）")
+                lines.append("")
+                lines.append("| 代码 | 名称 | 连板 | 行业 | 换手率 |")
+                lines.append("| --- | --- | --- | --- | --- |")
+                for _, r in high.head(15).iterrows():
+                    try:
+                        lines.append(
+                            f"| {r['代码']} | {r['名称']} | **{int(r['连板数'])}板** | "
+                            f"{r.get('所属行业', '-')} | {float(r.get('换手率', 0)):.2f}% |"
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                lines.append("")
+        except Exception:
+            pass
+
+    # ---- 今日龙虎榜净买 Top 10 ----
+    if lhb_detail is not None and not lhb_detail.empty:
+        try:
+            l = lhb_detail.copy()
+            l["龙虎榜净买额"] = pd.to_numeric(l.get("龙虎榜净买额", 0), errors="coerce").fillna(0)
+            agg = l.groupby(["代码", "名称"], as_index=False).agg(
+                净买额=("龙虎榜净买额", "sum"), 解读=("解读", "first"),
+            )
+            agg = agg.sort_values("净买额", ascending=False).head(10)
+            if not agg.empty and agg.iloc[0]["净买额"] > 0:
+                lines.append("## 🐯 今日龙虎榜净买 Top 10")
+                lines.append("")
+                lines.append("| 代码 | 名称 | 净买(万) | 解读 |")
+                lines.append("| --- | --- | --- | --- |")
+                for _, r in agg.iterrows():
+                    nb_wan = r["净买额"] / 1e4
+                    desc = str(r.get("解读", "-"))[:25]
+                    lines.append(f"| {r['代码']} | {r['名称']} | {nb_wan:+.0f} | {desc} |")
+                lines.append("")
+        except Exception:
+            pass
+
+    # ---- 明日 Top N 候选（含买点/止损建议）----
+    if picks:
+        lines.append(f"## 🎯 明日 Top {len(picks)} 候选（含买点 / 止损）")
+        lines.append("")
+        for i, s in enumerate(picks, 1):
+            d = s.as_dict()
+            streak = streak_map.get(s.code, 0)
+            tag = f" 🔁连{streak}日" if streak >= 2 else ""
+            entry_price = d['last_close']
+            stop = d['suggested_stop_loss']
+            stop_pct = (stop - entry_price) / entry_price * 100
+            # 买点：低开/平开 ≤2% → 直接买; 高开 2-5% → 等回踩 5 分钟均线; >5% → 不追
+            buy_low = entry_price
+            buy_high = entry_price * 1.02
+            lines.append(f"### #{i} {d['name']} ({d['code']}) · {d['industry']}{tag}")
+            lines.append("")
+            lines.append(f"- **综合分**：**{d['total']}** （趋势{d['trend']} 量能{d['volume']} 动量{d['momentum']} 资金{d['fund']} 安全{d['safety']} 换手{d['turnover']} 涨停{d['limit_up']} 估值{d['valuation']} 龙虎{d['longhu']} 财务{d['finance']}）")
+            lines.append(f"- **今日收盘**：{entry_price}")
+            lines.append(f"- **明日买点**：≤{buy_high:.2f}（高开 ≤2%）→ 直接买；高开 2-5% → 等回踩 5 分钟均线再买；**高开 >5% 不追**")
+            lines.append(f"- **止损位**：{stop}（约 {stop_pct:+.1f}%，跌破立即离场）")
+            lines.append("")
+
+    # ---- 风险声明 ----
+    lines.append("## ⚠️ 注意事项")
+    lines.append("")
+    lines.append("- 候选基于今日收盘后数据，**明日盘前可能出现新消息面**，请结合早盘新闻判断")
+    lines.append("- 若大盘明天跳空低开 >1%，**所有候选先观察不要买**")
+    lines.append("- 单只仓位不超过总资金 20%，跌破止损立刻走")
+    lines.append("- 同板块最多持有 2 只，避免风险过度集中")
+    lines.append("")
+    lines.append(f"*数据来源：Tushare（K线/北向/估值）+ akshare（同花顺资金流/涨停池/龙虎榜）*  ")
+    lines.append(f"*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+
+    return "\n".join(lines)
