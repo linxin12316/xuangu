@@ -1,8 +1,11 @@
 """历史选股回测——读取 picks/*.json 对比真实涨跌幅，计算命中率。
 
 用法：
-  python -m src.backtest              # 分析最近 5 个交易日，推送微信
+  python -m src.backtest              # 分析最近 14 天，推送微信
   python -m src.backtest --dry-run    # 控制台预览
+  python -m src.backtest --days 30    # 自定义回看窗口
+
+数据源：通过 data_loader.fetch_kline 走 Tushare daily（海外稳）。
 """
 from __future__ import annotations
 
@@ -38,6 +41,26 @@ def _load_recent_picks(days_back: int = 14) -> list[dict]:
         except Exception:
             continue
     return result
+
+
+def _benchmark_chg(pick_date: str, days: int) -> Optional[float]:
+    """沪深300同期涨幅（百分比），用于跑赢基准。"""
+    try:
+        pro = dl.get_tushare()
+        if pro is None:
+            return None
+        start = (datetime.strptime(pick_date, "%Y-%m-%d")).strftime("%Y%m%d")
+        end = (datetime.strptime(pick_date, "%Y-%m-%d") + timedelta(days=days * 2 + 10)).strftime("%Y%m%d")
+        df = pro.index_daily(ts_code="000300.SH", start_date=start, end_date=end)
+        if df is None or df.empty:
+            return None
+        df = df.sort_values("trade_date").reset_index(drop=True)
+        if len(df) < 2:
+            return None
+        idx = min(days, len(df) - 1)
+        return float((df["close"].iloc[idx] - df["close"].iloc[0]) / df["close"].iloc[0] * 100)
+    except Exception:
+        return None
 
 
 def _price_after(
@@ -86,9 +109,9 @@ def _price_after(
         return None
 
 
-def compute_stats(dry_run: bool = False) -> dict:
+def compute_stats(dry_run: bool = False, days_back: int = 14) -> dict:
     """分析近期 picks 表现。"""
-    picks = _load_recent_picks(days_back=14 if not dry_run else 1)
+    picks = _load_recent_picks(days_back=1 if dry_run else days_back)
 
     if not picks:
         return {"error": "没有找到历史 picks 记录", "picks": []}
@@ -97,6 +120,9 @@ def compute_stats(dry_run: bool = False) -> dict:
     by_date: dict[str, list] = {}
     for p in picks:
         by_date.setdefault(p["_pick_date"], []).append(p)
+
+    # 同期沪深300基准（每个 pick_date 各算一次,避免重复请求）
+    bench_cache: dict[tuple[str, int], Optional[float]] = {}
 
     results = []
     for pick_date, day_picks in by_date.items():
@@ -114,7 +140,15 @@ def compute_stats(dry_run: bool = False) -> dict:
             for w in WINDOWS:
                 price = _price_after(p["code"], pick_date, w)
                 if price and entry_price > 0:
-                    entry[f"chg_{w}d"] = (price - entry_price) / entry_price * 100
+                    chg = (price - entry_price) / entry_price * 100
+                    entry[f"chg_{w}d"] = chg
+                    # 跑赢基准
+                    bk = bench_cache.get((pick_date, w))
+                    if bk is None and (pick_date, w) not in bench_cache:
+                        bk = _benchmark_chg(pick_date, w)
+                        bench_cache[(pick_date, w)] = bk
+                    if bk is not None:
+                        entry[f"alpha_{w}d"] = chg - bk
                 else:
                     entry[f"chg_{w}d"] = None
             results.append(entry)
@@ -134,6 +168,8 @@ def compute_stats(dry_run: bool = False) -> dict:
             continue
         chgs = [r[f"chg_{w}d"] for r in valid]
         wins = sum(1 for c in chgs if c > 0)
+        alphas = [r[f"alpha_{w}d"] for r in valid if r.get(f"alpha_{w}d") is not None]
+        beat = sum(1 for a in alphas if a > 0) if alphas else None
         stats["by_window"][f"{w}d"] = {
             "count": len(valid),
             "win": wins,
@@ -141,6 +177,8 @@ def compute_stats(dry_run: bool = False) -> dict:
             "avg_return": round(sum(chgs) / len(chgs), 2),
             "max_gain": round(max(chgs), 2),
             "max_loss": round(min(chgs), 2),
+            "alpha_avg": round(sum(alphas) / len(alphas), 2) if alphas else None,
+            "beat_bench_rate": round(beat / len(alphas) * 100, 1) if alphas else None,
         }
 
     # 最佳/最差（按 5 日涨幅）
@@ -182,14 +220,19 @@ def render_report(stats: dict) -> str:
 
     lines.append("## 🎯 命中率")
     lines.append("")
-    lines.append("| 持有期 | 样本数 | 上涨次数 | 命中率 | 平均收益 | 最大收益 | 最大回撤 |")
+    lines.append("| 持有期 | 样本数 | 胜率 | 平均收益 | 跑赢沪深300 | 最大收益 | 最大回撤 |")
     lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     for w in WINDOWS:
         ws = stats["by_window"].get(f"{w}d")
         if ws:
+            alpha_str = (
+                f"{ws['beat_bench_rate']}% (α{ws['alpha_avg']:+.2f}%)"
+                if ws.get("beat_bench_rate") is not None
+                else "—"
+            )
             lines.append(
-                f"| {w} 个交易日 | {ws['count']} | {ws['win']} | "
-                f"{ws['win_rate']}% | {ws['avg_return']:+.2f}% | "
+                f"| {w} 日 | {ws['count']} | {ws['win_rate']}% | "
+                f"{ws['avg_return']:+.2f}% | {alpha_str} | "
                 f"{ws['max_gain']:+.2f}% | {ws['max_loss']:.2f}% |"
             )
     lines.append("")
@@ -218,9 +261,10 @@ def main(argv=None) -> int:
 
     parser = argparse.ArgumentParser(description="A 股选股回测")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--days", type=int, default=14, help="回看窗口天数")
     args = parser.parse_args(argv)
 
-    stats = compute_stats(dry_run=args.dry_run)
+    stats = compute_stats(dry_run=args.dry_run, days_back=args.days)
     md = render_report(stats)
 
     if args.dry_run:
