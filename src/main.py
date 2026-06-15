@@ -105,6 +105,12 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     if north_market_flow is not None:
         print(f"   💰 北向资金净流入 {north_market_flow:+.1f} 亿")
 
+    # --- 预热 Tushare 全市场缓存（每天调一次,用于新因子）---
+    print("📥 预热 Tushare 全市场缓存（北向/估值/涨停）…")
+    dl.fetch_hk_hold_market(use_mock=dry_run)
+    dl.fetch_daily_basic_market(use_mock=dry_run)
+    dl.fetch_limit_list_market(use_mock=dry_run)
+
     # --- 并发打分 ---
     print(f"📥 并发拉取日线 + 打分（{len(candidate_codes)} 只）…")
     scored = list(_score_candidates_concurrent(
@@ -341,10 +347,21 @@ def _score_candidates_concurrent(
             kline = dl.fetch_kline(code, days=80, use_mock=dry_run)
             north = dl.fetch_north_flow(code, use_mock=dry_run)
             to = turnover_map.get(code) if turnover_map else None
+            factors = dl.get_stock_factors(code, use_mock=dry_run)
+            # turnover 优先用 spot 当日值,缺失时回退 Tushare 上一交易日值
+            if to is None and factors.get("turnover_rate") is not None:
+                to = factors["turnover_rate"]
             s = score_one(
                 code, spot_map[code], industry, kline, north,
                 north_market_flow=north_market_flow,
                 turnover_rate=to,
+                limit_times_10d=factors.get("limit_times_10d", 0) or 0,
+                max_streak=factors.get("max_streak", 0) or 0,
+                pe_ttm=factors.get("pe_ttm"),
+                pb=factors.get("pb"),
+                longhu_active=None,  # 需 2000 积分,暂中性
+                roe=None,             # 需 2000 积分,暂中性
+                profit_growth=None,   # 需 2000 积分,暂中性
             )
             return s
         except Exception as e:  # noqa: BLE001
