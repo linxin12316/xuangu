@@ -1,0 +1,9 @@
+{
+  "_comment": "选股工具配置 - 不想推送的股票写在这里。修改后下次定时跑就生效。",
+  "blacklist": {
+    "codes": [],
+    "name_keywords": []
+  },
+  "max_per_industry": 2,
+  "max_picks": 5
+}
