@@ -69,6 +69,19 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     else:
         print("   ⚠️  板块接口不可用，降级为全市场涨幅排序")
 
+    # 同花顺资金流（海外稳定）：行业资金流 Top N + 概念资金流（仅展示）
+    print("📥 拉取同花顺资金流（行业 + 概念）…")
+    industry_ff = dl.fetch_industry_fundflow(use_mock=dry_run)
+    concept_ff = dl.fetch_concept_fundflow(use_mock=dry_run)
+    fundflow_top_industries: set[str] = set()
+    if industry_ff is not None and not industry_ff.empty:
+        # 取净流入 Top 6 作为"主力青睐"行业
+        fundflow_top_industries = set(industry_ff.head(6)["行业"].tolist())
+        print(f"   💰 行业资金流 Top 6: {list(fundflow_top_industries)}")
+    if concept_ff is not None and not concept_ff.empty:
+        top_concepts = concept_ff.head(5)["行业"].tolist()
+        print(f"   💡 概念资金流 Top 5: {top_concepts}")
+
     # 构建 spot_map + turnover_map
     name_col = "名称" if "名称" in spot.columns else spot.columns[1]
     spot_map = {str(r["代码"]).zfill(6): r[name_col] for _, r in spot.iterrows()}
@@ -83,9 +96,10 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
                 pass
 
     candidate_codes: dict[str, str] = {}  # code -> industry
-    # 路径 A: 行业择强 + 个股趋势双重筛选
-    if not industries.empty and market_window is not None and not market_window.empty:
-        hot_industries = set(industries["板块名称"].tolist())
+    # 路径 A: 行业择强（趋势 ∪ 资金流）+ 个股趋势双重筛选
+    trend_industries = set(industries["板块名称"].tolist()) if not industries.empty else set()
+    hot_industries = trend_industries | fundflow_top_industries  # 双轨取并集
+    if hot_industries and market_window is not None and not market_window.empty:
         # 1) 给所有股票打上行业标签
         df = market_window.copy()
         df["industry"] = df["code"].map(industry_map)
@@ -102,7 +116,10 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
             df = df.sort_values("__rank", ascending=False).head(200)
             for _, r in df.iterrows():
                 candidate_codes[r["code"]] = r["industry"]
-            print(f"   ✅ 热门行业候选池 {len(candidate_codes)} 只 (行业 Top {len(hot_industries)} → 个股 Top 200)")
+            src = []
+            if trend_industries: src.append(f"趋势{len(trend_industries)}")
+            if fundflow_top_industries: src.append(f"资金{len(fundflow_top_industries)}")
+            print(f"   ✅ 热门行业候选池 {len(candidate_codes)} 只 (来源:{'+'.join(src)})")
 
     # 降级路径
     if not candidate_codes:
@@ -157,6 +174,11 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     dl.fetch_daily_basic_market(use_mock=dry_run)
     dl.fetch_limit_list_market(use_mock=dry_run)
 
+    # --- 预热涨停池 + 龙虎榜缓存（akshare 同花顺/东财源,海外可用）---
+    print("📥 预热涨停池 + 龙虎榜缓存…")
+    dl.fetch_zt_pool(use_mock=dry_run)
+    dl.fetch_lhb_detail(use_mock=dry_run)
+
     # --- 并发打分 ---
     print(f"📥 并发拉取日线 + 打分（{len(candidate_codes)} 只）…")
     scored = list(_score_candidates_concurrent(
@@ -186,6 +208,10 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
         industries, picks, streak_map=streak_map,
         risk_score=risk_score, risk_desc=risk_desc,
         north_flow=north_market_flow,
+        concept_fundflow=concept_ff,
+        industry_fundflow=industry_ff,
+        zt_pool=dl.fetch_zt_pool(use_mock=dry_run),
+        lhb_detail=dl.fetch_lhb_detail(use_mock=dry_run),
     )
 
     if dry_run:
@@ -398,6 +424,7 @@ def _score_candidates_concurrent(
             north = dl.fetch_north_flow(code, use_mock=dry_run)
             to = turnover_map.get(code) if turnover_map else None
             factors = dl.get_stock_factors(code, use_mock=dry_run)
+            signals = dl.get_stock_market_signals(code, use_mock=dry_run)
             # turnover 优先用 spot 当日值,缺失时回退 Tushare 上一交易日值
             if to is None and factors.get("turnover_rate") is not None:
                 to = factors["turnover_rate"]
@@ -405,11 +432,11 @@ def _score_candidates_concurrent(
                 code, spot_map[code], industry, kline, north,
                 north_market_flow=north_market_flow,
                 turnover_rate=to,
+                zt_streak=signals.get("zt_streak", 0),
                 limit_times_10d=factors.get("limit_times_10d", 0) or 0,
-                max_streak=factors.get("max_streak", 0) or 0,
                 pe_ttm=factors.get("pe_ttm"),
                 pb=factors.get("pb"),
-                longhu_active=None,  # 需 2000 积分,暂中性
+                lhb_net_buy=signals.get("lhb_net_buy"),
                 roe=None,             # 需 2000 积分,暂中性
                 profit_growth=None,   # 需 2000 积分,暂中性
             )
