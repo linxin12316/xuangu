@@ -1,7 +1,12 @@
-"""数据加载层：封装 akshare + Tushare 双通道。
+"""数据加载层：三通道 — 腾讯直连 + Tushare + akshare。
 
-- akshare：海外 runner 上 spot/kline 走新浪 fallback 还能用，板块/北向/财务全废
-- Tushare：海外稳定，但免费 100 积分有接口权限和限速限制，按"全市场每日拉一次"使用
+数据源优先级（从 股票行情分析/recommend_engine.py 引入的直连模式）：
+- 腾讯财经 (qt.gtimg.cn)：批量实时行情，不封 IP，海外友好，含 PE/PB/量比/涨跌停
+- 同花顺热点 (zx.10jqka.com.cn)：零鉴权，当日强势股+题材归因
+- 东财 push2his：个股主力资金流直连，带节流防封
+- 东财 datacenter：龙虎榜等结构化数据直连
+- Tushare：K 线/北向/涨停列表（需要 TOKEN）
+- akshare：回退通道，东方财富→新浪依次 fallback
 
 所有对外暴露的函数都带 use_mock 参数，dry-run 时返回内置模拟数据。
 """
@@ -9,13 +14,17 @@ from __future__ import annotations
 
 import functools
 import io
+import json
 import os
+import random
 import time
+import urllib.request
 import warnings
 from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
+import requests
 
 warnings.filterwarnings("ignore")
 
@@ -39,6 +48,217 @@ def _retry(times: int = 3, delay: float = 1.5):
         return wrapper
 
     return deco
+
+
+# ---------- 东财防封: 节流 + 会话复用 ----------
+# 从 股票行情分析 项目引入的稳定直连模式
+EM_SESSION = requests.Session()
+EM_SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
+EM_MIN_INTERVAL = 1.0
+_em_last_call = [0.0]
+
+
+def em_get(url, params=None, headers=None, timeout=15, **kwargs):
+    """东财统一请求入口：自动节流 + Keep-Alive"""
+    wait = EM_MIN_INTERVAL - (time.time() - _em_last_call[0])
+    if wait > 0:
+        time.sleep(wait + random.uniform(0.1, 0.5))
+    try:
+        return EM_SESSION.get(url, params=params, headers=headers, timeout=timeout, **kwargs)
+    finally:
+        _em_last_call[0] = time.time()
+
+
+def eastmoney_datacenter(report_name, columns="ALL", filter_str="", page_size=50,
+                         sort_columns="", sort_types="-1"):
+    """东财数据中心统一查询（龙虎榜等结构化数据）"""
+    params = {
+        "reportName": report_name, "columns": columns,
+        "filter": filter_str, "pageNumber": "1", "pageSize": str(page_size),
+        "sortColumns": sort_columns, "sortTypes": sort_types,
+        "source": "WEB", "client": "WEB",
+    }
+    r = em_get("https://datacenter-web.eastmoney.com/api/data/v1/get", params=params, timeout=15)
+    d = r.json()
+    if d.get("result") and d["result"].get("data"):
+        return d["result"]["data"]
+    return []
+
+
+# ---------- 腾讯财经批量行情（海外友好，不封 IP）----------
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+
+
+def get_tencent_quotes(codes):
+    """
+    腾讯财经批量行情 — PE/PB/市值/换手率/涨跌停/量比
+    不封 IP，HTTP GBK 编码。从 股票行情分析 项目引入。
+    每批最多 50 只，自动分批。
+    返回: { "600519": { "price": ..., "change_pct": ..., ... } }
+    """
+    if not codes:
+        return {}
+
+    prefixed = []
+    for c in codes:
+        c = str(c).zfill(6)
+        if c.startswith(("6", "9")):
+            prefixed.append(f"sh{c}")
+        elif c.startswith("8"):
+            prefixed.append(f"bj{c}")
+        else:
+            prefixed.append(f"sz{c}")
+
+    result = {}
+    batch_size = 50
+    for i in range(0, len(prefixed), batch_size):
+        batch = prefixed[i:i + batch_size]
+        url = "https://qt.gtimg.cn/q=" + ",".join(batch)
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", UA)
+        try:
+            resp = urllib.request.urlopen(req, timeout=10)
+            data = resp.read().decode("gbk")
+            for line in data.strip().split(";"):
+                if not line.strip() or "=" not in line or '"' not in line:
+                    continue
+                key = line.split("=")[0].split("_")[-1]
+                vals = line.split('"')[1].split("~")
+                if len(vals) < 53:
+                    continue
+                code = key[2:]
+                result[code] = {
+                    "name": vals[1],
+                    "price": float(vals[3]) if vals[3] else 0,
+                    "last_close": float(vals[4]) if vals[4] else 0,
+                    "open": float(vals[5]) if vals[5] else 0,
+                    "change_amt": float(vals[31]) if vals[31] else 0,
+                    "change_pct": float(vals[32]) if vals[32] else 0,
+                    "high": float(vals[33]) if vals[33] else 0,
+                    "low": float(vals[34]) if vals[34] else 0,
+                    "amount_wan": float(vals[37]) if vals[37] else 0,  # 万元
+                    "turnover_pct": float(vals[38]) if vals[38] else 0,
+                    "pe_ttm": float(vals[39]) if vals[39] else 0,
+                    "amplitude_pct": float(vals[43]) if vals[43] else 0,
+                    "mcap_yi": float(vals[44]) if vals[44] else 0,      # 总市值(亿)
+                    "float_mcap_yi": float(vals[45]) if vals[45] else 0, # 流通市值(亿)
+                    "pb": float(vals[46]) if vals[46] else 0,
+                    "limit_up": float(vals[47]) if vals[47] else 0,
+                    "limit_down": float(vals[48]) if vals[48] else 0,
+                    "vol_ratio": float(vals[49]) if vals[49] else 0,     # 量比
+                    "pe_static": float(vals[52]) if vals[52] else 0,
+                }
+        except Exception as e:
+            print(f"   ⚠️  腾讯行情批次请求失败: {e}")
+    return result
+
+
+# ---------- 同花顺当日强势股（零鉴权，题材归因）----------
+
+def get_hot_stocks(date_str=None):
+    """
+    同花顺当日强势股 + 题材归因
+    零鉴权，73ms 返回 ~125 只股票。从 股票行情分析 项目引入。
+    """
+    if date_str is None:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    url = (f"http://zx.10jqka.com.cn/event/api/getharden/"
+           f"date/{date_str}/orderby/date/orderway/desc/charset/GBK/")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0 Safari/537.36"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        if data.get("errocode", 0) != 0:
+            return [], date_str, f"同花顺热点错误: {data.get('errormsg', '')}"
+
+        rows = data.get("data") or []
+        stocks = []
+        for row in rows:
+            stocks.append({
+                "code": row.get("code", ""),
+                "name": row.get("name", ""),
+                "reason": row.get("reason", ""),
+                "close": float(row.get("close", 0)),
+                "change_pct": float(row.get("zhangfu", 0)),
+                "turnover_pct": float(row.get("huanshou", 0)),
+                "amount": float(row.get("chengjiaoe", 0)),
+                "dde_net": float(row.get("ddejingliang", 0)),
+                "market": row.get("market", ""),
+            })
+        return stocks, date_str, None
+    except Exception as e:
+        return [], date_str, str(e)
+
+
+# ---------- 东财个股主力资金流（直连 push2his，节流）----------
+
+def get_fund_flow(codes, days=20):
+    """
+    个股资金流（东财 push2his，120 日级）
+    从 股票行情分析 项目引入。
+    codes: list of 6-digit codes
+    返回: {code: {"total_main_net": float, "positive_days": int, "trend": str}}
+    """
+    result = {}
+    for code in codes:
+        try:
+            market_code = 1 if code.startswith("6") else 0
+            url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+            params = {
+                "secid": f"{market_code}.{code}",
+                "fields1": "f1,f2,f3,f7",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+                "lmt": str(days + 5),
+            }
+            headers = {"User-Agent": UA, "Referer": "https://quote.eastmoney.com/"}
+            r = em_get(url, params=params, headers=headers, timeout=15)
+            d = r.json()
+            klines = d.get("data", {}).get("klines", [])
+
+            if not klines:
+                result[code] = {"total_main_net": 0, "positive_days": 0, "trend": "无数据"}
+                continue
+
+            main_nets = []
+            for line in klines[-days:]:
+                parts = line.split(",")
+                if len(parts) >= 2 and parts[1] != "-":
+                    main_nets.append(float(parts[1]))
+
+            if not main_nets:
+                result[code] = {"total_main_net": 0, "positive_days": 0, "trend": "无数据"}
+                continue
+
+            total = sum(main_nets)
+            positive = sum(1 for x in main_nets if x > 0)
+
+            # 趋势判断
+            if len(main_nets) >= 10:
+                first_half = sum(main_nets[:len(main_nets) // 2])
+                second_half = sum(main_nets[len(main_nets) // 2:])
+                if first_half < 0 and second_half > 0:
+                    trend = "反转流入"
+                elif first_half > 0 and second_half < 0:
+                    trend = "转流出"
+                elif total > 0:
+                    trend = "持续流入"
+                else:
+                    trend = "持续流出"
+            else:
+                trend = "持续流入" if total > 0 else "持续流出"
+
+            result[code] = {
+                "total_main_net": total,
+                "positive_days": positive,
+                "trend": trend,
+            }
+        except Exception as e:
+            result[code] = {"total_main_net": 0, "positive_days": 0, "trend": f"错误: {e}"}
+    return result
 
 
 # ---------- Tushare 单例 ----------
@@ -95,21 +315,21 @@ def _last_trade_date_str() -> str:
 # ---------- mock 数据（dry-run 用） ----------
 
 _MOCK_SPOT_CSV = """代码,名称,最新价,涨跌幅,成交额,总市值,市净率
-600519,贵州茅台,1680.0,1.2,8500000000,2100000000000,9.5
-000858,五粮液,158.3,2.1,3200000000,610000000000,5.8
-300750,宁德时代,210.5,3.5,5800000000,950000000000,4.2
-002594,比亚迪,265.2,1.8,4100000000,770000000000,3.9
-601318,中国平安,48.6,0.5,2200000000,890000000000,1.0
-000001,平安银行,11.2,-0.3,1500000000,220000000000,0.6
-600036,招商银行,38.5,0.8,1900000000,970000000000,1.0
-600900,长江电力,28.6,1.5,1100000000,700000000000,3.5
-000333,美的集团,68.5,1.9,1700000000,470000000000,3.2
-600276,恒瑞医药,45.2,2.3,1300000000,290000000000,5.1
-300059,东方财富,15.8,4.2,3800000000,250000000000,4.0
-002415,海康威视,32.1,2.8,2100000000,300000000000,3.8
-000725,京东方Α,4.85,3.1,2900000000,180000000000,1.2
-600030,中信证券,22.3,1.7,1800000000,330000000000,1.4
-601012,隆基绿能,18.5,3.6,1600000000,140000000000,2.0
+600183,生益科技,166.41,10.0,38000000000,398500000000,8.5
+301217,铜冠铜箔,170.16,20.0,25000000000,141100000000,12.3
+300570,太辰光,222.10,20.0,18000000000,42700000000,9.8
+300408,三环集团,150.25,18.77,22000000000,280900000000,6.5
+688388,嘉元科技,66.79,15.41,12000000000,30400000000,5.2
+601958,金钼股份,28.07,9.99,35000000000,90600000000,3.8
+002913,奥士康,61.58,10.0,15000000000,18600000000,4.5
+002484,江海股份,32.50,12.5,8000000000,27000000000,3.2
+300162,雷曼光电,10.38,4.32,3000000000,3600000000,2.1
+002335,科华数据,42.80,7.5,14000000000,19500000000,4.8
+603083,剑桥科技,85.60,6.8,12000000000,22000000000,5.5
+002364,中恒电气,18.50,8.2,6000000000,10000000000,3.6
+600520,三佳科技,25.30,5.6,4000000000,6400000000,2.8
+600549,厦门钨业,35.80,9.2,16000000000,50000000000,4.1
+600362,江西铜业,28.50,4.5,20000000000,98000000000,1.5
 """
 
 
@@ -144,12 +364,14 @@ def _mock_kline(code: str, days: int = 60) -> pd.DataFrame:
 
 
 _MOCK_INDUSTRIES = [
-    ("白酒", 8.5),
-    ("电池", 6.2),
-    ("汽车整车", 5.8),
-    ("证券", 4.1),
-    ("银行", 0.5),
-    ("化学制药", -1.2),
+    ("元件", 8.5),
+    ("电子化学品", 7.8),
+    ("半导体", 7.2),
+    ("通信设备", 6.5),
+    ("小金属", 5.8),
+    ("PCB概念", 5.2),
+    ("CPO概念", 4.8),
+    ("铜箔", 4.5),
 ]
 
 
@@ -161,18 +383,14 @@ def _mock_industry_top(top_n: int = 5) -> pd.DataFrame:
 
 # mock 行业 → 该行业的 mock 代码（与 fetch_industry_map 的 mock 数据保持一致）
 _MOCK_INDUSTRY_CONS = {
-    "白酒": [("600519", "贵州茅台"), ("000858", "五粮液")],
-    "电池": [("300750", "宁德时代")],
-    "汽车整车": [("002594", "比亚迪")],
-    "保险": [("601318", "中国平安")],
-    "银行": [("000001", "平安银行"), ("600036", "招商银行")],
-    "电力": [("600900", "长江电力")],
-    "家电": [("000333", "美的集团")],
-    "化学制药": [("600276", "恒瑞医药")],
-    "证券": [("300059", "东方财富"), ("600030", "中信证券")],
-    "安防设备": [("002415", "海康威视")],
-    "面板": [("000725", "京东方Α")],
-    "光伏设备": [("601012", "隆基绿能")],
+    "元件": [("600183", "生益科技"), ("002484", "江海股份")],
+    "电子化学品": [("301217", "铜冠铜箔"), ("688388", "嘉元科技")],
+    "半导体": [("300408", "三环集团"), ("600520", "三佳科技")],
+    "通信设备": [("300570", "太辰光"), ("603083", "剑桥科技")],
+    "小金属": [("601958", "金钼股份"), ("600549", "厦门钨业"), ("600362", "江西铜业")],
+    "PCB概念": [("002913", "奥士康"), ("600183", "生益科技")],
+    "CPO概念": [("300570", "太辰光")],
+    "铜箔": [("301217", "铜冠铜箔"), ("688388", "嘉元科技")],
 }
 
 
@@ -190,38 +408,71 @@ def _mock_industry_cons(industry: str) -> pd.DataFrame:
 def fetch_spot(use_mock: bool = False) -> pd.DataFrame:
     """全市场 A 股快照。
 
-    优先尝试东方财富 (stock_zh_a_spot_em)，失败回退到新浪 (stock_zh_a_spot)。
-    新浪对海外 IP 更友好，适合 GitHub Actions 海外 runner。
+    推荐通道（新）: Tushare daily_basic + market_window 聚合（海外稳定）
+    回退通道 1（旧）: 东方财富 (stock_zh_a_spot_em)
+    回退通道 2（旧）: 新浪 (stock_zh_a_spot)
+
+    返回 DataFrame，列：代码, 名称, 最新价, 涨跌幅, 成交额, 总市值, 换手率
     """
     if use_mock:
         return _mock_spot()
-    import akshare as ak
 
+    # 推荐通道: Tushare daily_basic + market_window 聚合
+    db = fetch_daily_basic_market(use_mock=False)
+    window = fetch_market_window(days=6, use_mock=False)
+    if db is not None and not db.empty and window is not None and not window.empty:
+        try:
+            # db 有 total_mv(总市值), circ_mv, pe_ttm, pb, turnover_rate
+            # window 有 close_now(最新收盘), chg_5d(5日涨幅), amount_now(成交额千元)
+            merged = db.merge(window, on="ts_code", how="inner")
+            # 用统一的 stock_basic 缓存获取名称（避免重复调用 Tushare）
+            name_map = _get_stock_basic_names()
+            # 标准化列名
+            rows = []
+            for _, r in merged.iterrows():
+                ts_code = str(r.get("ts_code", ""))
+                code = ts_code.split(".")[0]
+                name = name_map.get(code, "")
+                close = float(r.get("close_now", 0) or 0)
+                chg = float(r.get("chg_5d", 0) or 0)  # 5日涨幅 ≈ 当日涨跌幅代理
+                amount = float(r.get("amount_now", 0) or 0) * 1000  # 千元→元
+                total_mv = float(r.get("total_mv", 0) or 0)
+                pb = float(r.get("pb", 0) or 0) if pd.notna(r.get("pb")) else 0
+                turnover = float(r.get("turnover_rate", 0) or 0) if pd.notna(r.get("turnover_rate")) else 0
+                rows.append({
+                    "代码": code, "名称": name, "最新价": close,
+                    "涨跌幅": chg, "成交额": amount, "总市值": total_mv,
+                    "市净率": pb, "换手率": turnover,
+                })
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                print(f"   ✅ Tushare 聚合全市场快照 {len(df)} 只")
+                return df
+        except Exception as e:
+            print(f"   ⚠️  Tushare 聚合快照失败: {e}, 回退 akshare")
+
+    # 回退通道 1: 东方财富 (akshare)
+    import akshare as ak
     try:
         df = ak.stock_zh_a_spot_em()
         if df is not None and not df.empty:
+            # 添加换手率列(如果存在)
+            if "换手率" in df.columns:
+                df = df.rename(columns={"换手率": "换手率"})
             return df
     except Exception as e:  # noqa: BLE001
         print(f"   ⚠️  东方财富快照失败: {e}, 回退新浪源")
 
-    # 新浪源：列名不同，需要标准化
+    # 回退通道 2: 新浪源
     df = ak.stock_zh_a_spot()
     rename_map = {
-        "symbol": "代码",
-        "code": "代码",
-        "name": "名称",
-        "trade": "最新价",
-        "changepercent": "涨跌幅",
-        "amount": "成交额",
-        "mktcap": "总市值",
-        "pb": "市净率",
+        "symbol": "代码", "code": "代码", "name": "名称", "trade": "最新价",
+        "changepercent": "涨跌幅", "amount": "成交额", "mktcap": "总市值", "pb": "市净率",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
     if "代码" in df.columns:
-        # 新浪代码带 sh/sz 前缀，去掉
         df["代码"] = df["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
     if "总市值" in df.columns:
-        # 新浪单位是万元，转换为元
         df["总市值"] = pd.to_numeric(df["总市值"], errors="coerce") * 1e4
     return df
 
@@ -406,7 +657,7 @@ def fetch_hk_hold_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
         # mock: 给若干代码生成一个模拟的 5 日持股变动
         import random
         rows = []
-        for code in ["600519.SH", "000858.SZ", "300750.SZ", "002594.SZ"]:
+        for code in ["600183.SH", "301217.SZ", "300570.SZ", "601958.SH"]:
             random.seed(hash(code) & 0xffff)
             rows.append({"ts_code": code, "north_5d_change": random.uniform(-2, 4)})
         _HK_HOLD_CACHE = pd.DataFrame(rows)
@@ -445,7 +696,7 @@ def fetch_daily_basic_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
     _DAILY_BASIC_TRIED = True
     if use_mock:
         rows = []
-        for code in ["600519.SH", "000858.SZ", "300750.SZ", "002594.SZ"]:
+        for code in ["600183.SH", "301217.SZ", "300570.SZ", "601958.SH"]:
             rows.append({"ts_code": code, "pe_ttm": 25.0, "pb": 4.0,
                          "turnover_rate": 1.5, "total_mv": 5e9})
         _DAILY_BASIC_CACHE = pd.DataFrame(rows)
@@ -484,8 +735,9 @@ def fetch_limit_list_market(use_mock: bool = False) -> Optional[pd.DataFrame]:
     _LIMIT_LIST_TRIED = True
     if use_mock:
         rows = [
-            {"ts_code": "300750.SZ", "limit_times_10d": 2, "max_streak": 1},
-            {"ts_code": "300059.SZ", "limit_times_10d": 3, "max_streak": 2},
+            {"ts_code": "600183.SH", "limit_times_10d": 1, "max_streak": 1},
+            {"ts_code": "301217.SZ", "limit_times_10d": 2, "max_streak": 2},
+            {"ts_code": "601958.SH", "limit_times_10d": 3, "max_streak": 3},
         ]
         _LIMIT_LIST_CACHE = pd.DataFrame(rows)
         return _LIMIT_LIST_CACHE
@@ -642,14 +894,21 @@ def fetch_industry_map(use_mock: bool = False) -> dict:
     if _INDUSTRY_MAP_TRIED:
         return _INDUSTRY_MAP_CACHE or {}
     _INDUSTRY_MAP_TRIED = True
+
+    # 如果 _get_stock_basic_names() 已经拉过数据，直接用它填充的缓存
+    if _STOCK_BASIC_NAMES_TRIED and _INDUSTRY_MAP_CACHE:
+        return _INDUSTRY_MAP_CACHE
+
     if use_mock:
         _INDUSTRY_MAP_CACHE = {
-            "600519": "白酒", "000858": "白酒",
-            "300750": "电池", "002594": "汽车整车",
-            "601318": "保险", "000001": "银行", "600036": "银行",
-            "600900": "电力", "000333": "家电", "600276": "化学制药",
-            "300059": "证券", "002415": "安防设备",
-            "000725": "面板", "600030": "证券", "601012": "光伏设备",
+            "600183": "元件", "002484": "元件",
+            "301217": "电子化学品", "688388": "电子化学品",
+            "300408": "半导体", "600520": "半导体",
+            "300570": "通信设备", "603083": "通信设备",
+            "601958": "小金属", "600549": "小金属", "600362": "小金属",
+            "002913": "PCB概念",
+            "002335": "算力设备", "002364": "算力设备",
+            "300162": "LED",
         }
         return _INDUSTRY_MAP_CACHE
     pro = get_tushare()
@@ -809,9 +1068,11 @@ def fetch_industry_fundflow(use_mock: bool = False) -> Optional[pd.DataFrame]:
     _INDUSTRY_FUNDFLOW_TRIED = True
     if use_mock:
         _INDUSTRY_FUNDFLOW_CACHE = pd.DataFrame([
-            {"行业": "元件", "行业-涨跌幅": 4.5, "净额": 35.2, "公司家数": 62, "领涨股": "达利凯普", "领涨股-涨跌幅": 12.0},
-            {"行业": "电子化学品", "行业-涨跌幅": 3.8, "净额": 22.1, "公司家数": 42, "领涨股": "天承科技", "领涨股-涨跌幅": 9.5},
-            {"行业": "白酒", "行业-涨跌幅": 1.2, "净额": 8.5, "公司家数": 18, "领涨股": "贵州茅台", "领涨股-涨跌幅": 2.0},
+            {"行业": "元件", "行业-涨跌幅": 6.5, "净额": 85.2, "公司家数": 62, "领涨股": "生益科技", "领涨股-涨跌幅": 10.0},
+            {"行业": "电子化学品", "行业-涨跌幅": 7.8, "净额": 52.1, "公司家数": 42, "领涨股": "铜冠铜箔", "领涨股-涨跌幅": 20.0},
+            {"行业": "半导体", "行业-涨跌幅": 7.2, "净额": 68.5, "公司家数": 180, "领涨股": "三环集团", "领涨股-涨跌幅": 18.8},
+            {"行业": "通信设备", "行业-涨跌幅": 6.8, "净额": 35.6, "公司家数": 85, "领涨股": "太辰光", "领涨股-涨跌幅": 20.0},
+            {"行业": "小金属", "行业-涨跌幅": 5.8, "净额": 28.3, "公司家数": 45, "领涨股": "金钼股份", "领涨股-涨跌幅": 10.0},
         ])
         return _INDUSTRY_FUNDFLOW_CACHE
     try:
@@ -841,9 +1102,12 @@ def fetch_zt_pool(use_mock: bool = False) -> Optional[pd.DataFrame]:
     _ZT_POOL_TRIED = True
     if use_mock:
         _ZT_POOL_CACHE = pd.DataFrame([
-            {"代码": "603065", "名称": "宿迁联盛", "连板数": 4, "涨停统计": "8/5", "所属行业": "化学制品", "换手率": 12.5},
-            {"代码": "000768", "名称": "中航西飞", "连板数": 1, "涨停统计": "1/1", "所属行业": "航空装备", "换手率": 3.5},
-            {"代码": "601958", "名称": "金钼股份", "连板数": 2, "涨停统计": "2/2", "所属行业": "小金属", "换手率": 5.8},
+            {"代码": "600183", "名称": "生益科技", "连板数": 1, "涨停统计": "1/1", "所属行业": "元件", "换手率": 3.2},
+            {"代码": "301217", "名称": "铜冠铜箔", "连板数": 2, "涨停统计": "2/2", "所属行业": "电子化学品", "换手率": 8.5},
+            {"代码": "601958", "名称": "金钼股份", "连板数": 3, "涨停统计": "3/3", "所属行业": "小金属", "换手率": 12.8},
+            {"代码": "300570", "名称": "太辰光", "连板数": 1, "涨停统计": "1/1", "所属行业": "通信设备", "换手率": 6.5},
+            {"代码": "300408", "名称": "三环集团", "连板数": 1, "涨停统计": "1/1", "所属行业": "半导体", "换手率": 4.8},
+            {"代码": "002913", "名称": "奥士康", "连板数": 1, "涨停统计": "1/1", "所属行业": "PCB概念", "换手率": 5.5},
         ])
         return _ZT_POOL_CACHE
     try:
@@ -880,10 +1144,14 @@ def fetch_lhb_detail(use_mock: bool = False) -> Optional[pd.DataFrame]:
     _LHB_DETAIL_TRIED = True
     if use_mock:
         _LHB_DETAIL_CACHE = pd.DataFrame([
-            {"代码": "603065", "名称": "宿迁联盛", "解读": "知名游资买入",
-             "龙虎榜净买额": 2.5e8, "上榜原因": "日涨幅偏离值达7%"},
-            {"代码": "000768", "名称": "中航西飞", "解读": "机构买入",
-             "龙虎榜净买额": 1.2e8, "上榜原因": "日涨幅偏离值达7%"},
+            {"代码": "600183", "名称": "生益科技", "解读": "机构买入",
+             "龙虎榜净买额": 5.8e8, "上榜原因": "日涨幅偏离值达7%"},
+            {"代码": "301217", "名称": "铜冠铜箔", "解读": "知名游资买入",
+             "龙虎榜净买额": 3.2e8, "上榜原因": "日涨幅偏离值达7%"},
+            {"代码": "300570", "名称": "太辰光", "解读": "游资+机构合力",
+             "龙虎榜净买额": 2.6e8, "上榜原因": "日涨幅偏离值达7%"},
+            {"代码": "601958", "名称": "金钼股份", "解读": "知名游资买入",
+             "龙虎榜净买额": 1.8e8, "上榜原因": "连续三个交易日内涨幅偏离值累计达20%"},
         ])
         return _LHB_DETAIL_CACHE
     try:
@@ -937,3 +1205,151 @@ def get_stock_market_signals(code: str, use_mock: bool = False) -> dict:
                 pass
 
     return out
+
+
+# ---------- 腾讯行情增强注入（候选股实时数据）----------
+
+def enrich_with_tencent(codes: list[str]) -> dict:
+    """用腾讯财经行情给候选股注入实时量比/PE/PB/市值。
+
+    从 股票行情分析 项目引入。
+    返回: { "600519": { "vol_ratio": 1.5, "pe_ttm": 25.0, "pb": 4.0, "mcap_yi": 20000, ... } }
+    """
+    raw = get_tencent_quotes(codes)
+    enriched = {}
+    for code, q in raw.items():
+        enriched[code] = {
+            "vol_ratio": q.get("vol_ratio", 0),
+            "pe_ttm": q.get("pe_ttm", 0),
+            "pb": q.get("pb", 0),
+            "mcap_yi": q.get("mcap_yi", 0),
+            "turnover_pct": q.get("turnover_pct", 0),
+            "amount_wan": q.get("amount_wan", 0),
+            "change_pct": q.get("change_pct", 0),
+        }
+    return enriched
+
+
+def fetch_hot_stocks_candidates() -> dict:
+    """获取同花顺当日强势股（零鉴权，含题材归因）。
+
+    从 股票行情分析 项目引入。
+    返回: { "600519": { "name": "贵州茅台", "reason": "白酒+消费", "change_pct": 1.2, ... } }
+    失败返回空 dict，不抛异常。
+    """
+    stocks, _, err = get_hot_stocks()
+    if not stocks and err:
+        # 尝试前一交易日
+        for offset in range(1, 5):
+            fallback = (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+            stocks, _, err = get_hot_stocks(fallback)
+            if stocks:
+                break
+    if not stocks:
+        return {}
+
+    # 过滤北交所/新股
+    stocks = [s for s in stocks
+              if not s["code"].startswith(("8", "4"))
+              and not s["name"].startswith("N")]
+
+    out = {}
+    for s in stocks:
+        out[s["code"]] = {
+            "name": s["name"],
+            "reason": s["reason"],
+            "change_pct": s["change_pct"],
+            "turnover_pct": s["turnover_pct"],
+            "dde_net": s["dde_net"],
+        }
+    return out
+
+
+# ---------- 东财个股资金流（包装成现有因子格式）----------
+
+def enrich_with_fundflow(codes: list[str]) -> dict:
+    """获取个股主力资金流，返回评分可用的格式。
+
+    通道 1（推荐）: 东财 push2his 直连（海外友好，但个别 IP 被限流）
+    通道 2（fallback）: akshare stock_individual_fund_flow（东方财富）
+    从 股票行情分析 项目引入。
+    返回: { "600519": { "total_main_net": 50000000, "positive_days": 12, "trend": "持续流入" } }
+    失败返回空 dict，不抛异常。
+    """
+    # 通道 1: 东财直连
+    try:
+        ff = get_fund_flow(codes)
+        out = {}
+        for code, fd in ff.items():
+            if fd.get("trend", "").startswith("错误") or fd.get("trend") == "无数据":
+                continue
+            out[code] = fd
+        if out:
+            return out
+    except Exception:
+        pass
+
+    # 通道 2: akshare fallback（个股资金流排名，按代码筛选）
+    try:
+        import akshare as ak
+
+        df = ak.stock_individual_fund_flow(stock="all", market="sh")
+        if df is not None and not df.empty:
+            code_set = {c.zfill(6) for c in codes}
+            out = {}
+            for _, r in df.iterrows():
+                code = str(r.get("股票代码", "")).zfill(6) if "股票代码" in r.columns else ""
+                if not code or code not in code_set:
+                    continue
+                net = float(r.get("主力净流入", 0) or 0)
+                out[code] = {
+                    "total_main_net": net,
+                    "positive_days": 1 if net > 0 else 0,
+                    "trend": "流入" if net > 0 else ("流出" if net < 0 else "平衡"),
+                }
+            if out:
+                print(f"      ✅ akshare 资金流 {len(out)} 只")
+                return out
+    except Exception:
+        pass
+
+    return {}
+
+
+def _get_stock_basic_names() -> dict:
+    """从 Tushare stock_basic 获取代码→名称映射，失败返回空 dict。
+
+    带会话级缓存，和 fetch_industry_map 共用一次 stock_basic 调用。
+    """
+    # 优先从行业映射缓存取名称（stock_basic 已被 fetch_industry_map 拉过）
+    global _INDUSTRY_MAP_CACHE
+    # 从 stock_basic 同时拿 name 字段存在 _STOCK_BASIC_NAMES_CACHE
+    global _STOCK_BASIC_NAMES_CACHE, _STOCK_BASIC_NAMES_TRIED
+
+    if _STOCK_BASIC_NAMES_TRIED:
+        return _STOCK_BASIC_NAMES_CACHE or {}
+    _STOCK_BASIC_NAMES_TRIED = True
+
+    pro = get_tushare()
+    if pro is None:
+        _STOCK_BASIC_NAMES_CACHE = {}
+        return {}
+    try:
+        # 一次调用同时拿 symbol, name, industry，供两个缓存共享
+        sb = pro.stock_basic(exchange="", list_status="L", fields="symbol,name,industry")
+        if sb is not None and not sb.empty:
+            _STOCK_BASIC_NAMES_CACHE = dict(zip(sb["symbol"].astype(str), sb["name"].astype(str)))
+            # 也填充行业映射缓存，避免 fetch_industry_map 再调一次
+            ind_sb = sb.dropna(subset=["industry"])
+            _INDUSTRY_MAP_CACHE = dict(zip(ind_sb["symbol"].astype(str), ind_sb["industry"].astype(str)))
+            print(f"   ✅ Tushare stock_basic 名称+行业 {len(_STOCK_BASIC_NAMES_CACHE)} 只")
+            return _STOCK_BASIC_NAMES_CACHE
+    except Exception:
+        pass
+    _STOCK_BASIC_NAMES_CACHE = {}
+    return {}
+
+
+# 会话级缓存
+_STOCK_BASIC_NAMES_CACHE: Optional[dict] = None
+_STOCK_BASIC_NAMES_TRIED = False
