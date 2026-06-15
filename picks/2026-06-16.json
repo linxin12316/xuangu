@@ -1,23 +1,5 @@
 [
   {
-    "code": "000970",
-    "name": "中科三环",
-    "industry": "全市场",
-    "total": 82.5,
-    "trend": 22.0,
-    "volume": 18.0,
-    "momentum": 12.0,
-    "fund": 10.0,
-    "safety": 8.0,
-    "turnover": 2.5,
-    "limit_up": 0.0,
-    "valuation": 5.0,
-    "longhu": 2.5,
-    "finance": 2.5,
-    "last_close": 13.43,
-    "suggested_stop_loss": 12.49
-  },
-  {
     "code": "600392",
     "name": "盛和资源",
     "industry": "全市场",
@@ -36,12 +18,12 @@
     "suggested_stop_loss": 24.54
   },
   {
-    "code": "002657",
-    "name": "中科金财",
+    "code": "600397",
+    "name": "江钨装备",
     "industry": "全市场",
-    "total": 82.5,
+    "total": 80.2,
     "trend": 22.0,
-    "volume": 18.0,
+    "volume": 15.7,
     "momentum": 12.0,
     "fund": 10.0,
     "safety": 8.0,
@@ -50,14 +32,14 @@
     "valuation": 5.0,
     "longhu": 2.5,
     "finance": 2.5,
-    "last_close": 21.85,
-    "suggested_stop_loss": 20.32
+    "last_close": 15.17,
+    "suggested_stop_loss": 14.11
   },
   {
-    "code": "600060",
-    "name": "海信视像",
+    "code": "000048",
+    "name": "京基智农",
     "industry": "全市场",
-    "total": 82.5,
+    "total": 80.0,
     "trend": 22.0,
     "volume": 18.0,
     "momentum": 12.0,
@@ -66,18 +48,18 @@
     "turnover": 2.5,
     "limit_up": 0.0,
     "valuation": 5.0,
-    "longhu": 2.5,
+    "longhu": 0.0,
     "finance": 2.5,
-    "last_close": 27.09,
-    "suggested_stop_loss": 25.88
+    "last_close": 17.37,
+    "suggested_stop_loss": 16.15
   },
   {
-    "code": "002583",
-    "name": "海能达",
+    "code": "002129",
+    "name": "TCL中环",
     "industry": "全市场",
-    "total": 82.5,
+    "total": 79.6,
     "trend": 22.0,
-    "volume": 18.0,
+    "volume": 15.1,
     "momentum": 12.0,
     "fund": 10.0,
     "safety": 8.0,
@@ -86,7 +68,25 @@
     "valuation": 5.0,
     "longhu": 2.5,
     "finance": 2.5,
-    "last_close": 9.5,
-    "suggested_stop_loss": 8.86
+    "last_close": 10.26,
+    "suggested_stop_loss": 9.61
+  },
+  {
+    "code": "000831",
+    "name": "中国稀土",
+    "industry": "全市场",
+    "total": 79.3,
+    "trend": 22.0,
+    "volume": 14.8,
+    "momentum": 12.0,
+    "fund": 10.0,
+    "safety": 8.0,
+    "turnover": 2.5,
+    "limit_up": 0.0,
+    "valuation": 5.0,
+    "longhu": 2.5,
+    "finance": 2.5,
+    "last_close": 58.4,
+    "suggested_stop_loss": 54.31
   }
 ]
