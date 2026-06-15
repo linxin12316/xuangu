@@ -547,9 +547,58 @@ def _reset_caches_for_test():
     """单元测试用：重置全市场缓存。"""
     global _HK_HOLD_CACHE, _DAILY_BASIC_CACHE, _LIMIT_LIST_CACHE
     global _HK_HOLD_TRIED, _DAILY_BASIC_TRIED, _LIMIT_LIST_TRIED
+    global _INDUSTRY_MAP_CACHE, _INDUSTRY_MAP_TRIED
     _HK_HOLD_CACHE = None
     _DAILY_BASIC_CACHE = None
     _LIMIT_LIST_CACHE = None
     _HK_HOLD_TRIED = False
     _DAILY_BASIC_TRIED = False
     _LIMIT_LIST_TRIED = False
+    _INDUSTRY_MAP_CACHE = None
+    _INDUSTRY_MAP_TRIED = False
+
+
+# ---------- 全市场行业映射（Tushare stock_basic, 不限速）----------
+
+_INDUSTRY_MAP_CACHE: Optional[dict] = None
+_INDUSTRY_MAP_TRIED = False
+
+
+def fetch_industry_map(use_mock: bool = False) -> dict:
+    """全市场代码→行业映射，{ "600519": "白酒", ... }。
+
+    Tushare stock_basic 接口免费版完全可用，不限速，覆盖 ~5500 只 A 股。
+    单次会话内只拉一次。失败时回退空字典（行业字段会显示"全市场"占位）。
+    """
+    global _INDUSTRY_MAP_CACHE, _INDUSTRY_MAP_TRIED
+    if _INDUSTRY_MAP_TRIED:
+        return _INDUSTRY_MAP_CACHE or {}
+    _INDUSTRY_MAP_TRIED = True
+    if use_mock:
+        _INDUSTRY_MAP_CACHE = {
+            "600519": "白酒", "000858": "白酒",
+            "300750": "电池", "002594": "汽车整车",
+            "601318": "保险", "000001": "银行", "600036": "银行",
+            "600900": "电力", "000333": "家电", "600276": "化学制药",
+            "300059": "证券", "002415": "安防设备",
+            "000725": "面板", "600030": "证券", "601012": "光伏设备",
+        }
+        return _INDUSTRY_MAP_CACHE
+    pro = get_tushare()
+    if pro is None:
+        _INDUSTRY_MAP_CACHE = {}
+        return {}
+    try:
+        df = pro.stock_basic(exchange="", list_status="L",
+                             fields="symbol,industry")
+        if df is None or df.empty:
+            _INDUSTRY_MAP_CACHE = {}
+            return {}
+        df = df.dropna(subset=["industry"])
+        _INDUSTRY_MAP_CACHE = dict(zip(df["symbol"].astype(str), df["industry"].astype(str)))
+        print(f"   ✅ Tushare stock_basic 行业映射 {len(_INDUSTRY_MAP_CACHE)} 只")
+        return _INDUSTRY_MAP_CACHE
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  Tushare stock_basic 失败: {e}")
+        _INDUSTRY_MAP_CACHE = {}
+        return {}
