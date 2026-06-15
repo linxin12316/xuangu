@@ -602,6 +602,10 @@ def _reset_caches_for_test():
     global _HK_HOLD_TRIED, _DAILY_BASIC_TRIED, _LIMIT_LIST_TRIED
     global _INDUSTRY_MAP_CACHE, _INDUSTRY_MAP_TRIED
     global _MARKET_WINDOW_CACHE, _MARKET_WINDOW_TRIED
+    global _CONCEPT_FUNDFLOW_CACHE, _CONCEPT_FUNDFLOW_TRIED
+    global _INDUSTRY_FUNDFLOW_CACHE, _INDUSTRY_FUNDFLOW_TRIED
+    global _ZT_POOL_CACHE, _ZT_POOL_TRIED
+    global _LHB_DETAIL_CACHE, _LHB_DETAIL_TRIED
     _HK_HOLD_CACHE = None
     _DAILY_BASIC_CACHE = None
     _LIMIT_LIST_CACHE = None
@@ -612,6 +616,14 @@ def _reset_caches_for_test():
     _INDUSTRY_MAP_TRIED = False
     _MARKET_WINDOW_CACHE = None
     _MARKET_WINDOW_TRIED = False
+    _CONCEPT_FUNDFLOW_CACHE = None
+    _CONCEPT_FUNDFLOW_TRIED = False
+    _INDUSTRY_FUNDFLOW_CACHE = None
+    _INDUSTRY_FUNDFLOW_TRIED = False
+    _ZT_POOL_CACHE = None
+    _ZT_POOL_TRIED = False
+    _LHB_DETAIL_CACHE = None
+    _LHB_DETAIL_TRIED = False
 
 
 # ---------- 全市场行业映射（Tushare stock_basic, 不限速）----------
@@ -742,3 +754,183 @@ def fetch_market_window(days: int = 6, use_mock: bool = False) -> Optional[pd.Da
     merged["code"] = merged["ts_code"].astype(str).str.split(".").str[0]
     _MARKET_WINDOW_CACHE = merged[["ts_code", "code", "close_now", "chg_5d", "amount_now"]]
     return _MARKET_WINDOW_CACHE
+
+
+# ---------- 同花顺资金流 + 涨停池 + 龙虎榜（akshare 海外可用源）----------
+
+_CONCEPT_FUNDFLOW_CACHE: Optional[pd.DataFrame] = None
+_CONCEPT_FUNDFLOW_TRIED = False
+_INDUSTRY_FUNDFLOW_CACHE: Optional[pd.DataFrame] = None
+_INDUSTRY_FUNDFLOW_TRIED = False
+_ZT_POOL_CACHE: Optional[pd.DataFrame] = None
+_ZT_POOL_TRIED = False
+_LHB_DETAIL_CACHE: Optional[pd.DataFrame] = None
+_LHB_DETAIL_TRIED = False
+
+
+def fetch_concept_fundflow(use_mock: bool = False) -> Optional[pd.DataFrame]:
+    """同花顺概念资金流（385 个概念，按净流入排序）。
+
+    返回字段: 行业(概念名), 行业指数, 行业-涨跌幅, 流入资金, 流出资金, 净额, 公司家数, 领涨股, 领涨股-涨跌幅, 当前价
+    """
+    global _CONCEPT_FUNDFLOW_CACHE, _CONCEPT_FUNDFLOW_TRIED
+    if _CONCEPT_FUNDFLOW_TRIED:
+        return _CONCEPT_FUNDFLOW_CACHE
+    _CONCEPT_FUNDFLOW_TRIED = True
+    if use_mock:
+        _CONCEPT_FUNDFLOW_CACHE = pd.DataFrame([
+            {"行业": "人工智能", "行业-涨跌幅": 5.2, "净额": 28.5, "公司家数": 120, "领涨股": "科大讯飞", "领涨股-涨跌幅": 9.8},
+            {"行业": "机器人", "行业-涨跌幅": 4.8, "净额": 18.2, "公司家数": 85, "领涨股": "拓斯达", "领涨股-涨跌幅": 8.5},
+            {"行业": "PCB概念", "行业-涨跌幅": 3.9, "净额": 15.6, "公司家数": 90, "领涨股": "胜宏科技", "领涨股-涨跌幅": 6.2},
+            {"行业": "低空经济", "行业-涨跌幅": 3.5, "净额": 12.3, "公司家数": 50, "领涨股": "中信海直", "领涨股-涨跌幅": 7.1},
+        ])
+        return _CONCEPT_FUNDFLOW_CACHE
+    try:
+        import akshare as ak
+        df = ak.stock_fund_flow_concept(symbol="即时")
+        if df is None or df.empty:
+            return None
+        # 净额单位是亿,排序按净额
+        df["净额"] = pd.to_numeric(df["净额"], errors="coerce").fillna(0)
+        df = df.sort_values("净额", ascending=False).reset_index(drop=True)
+        _CONCEPT_FUNDFLOW_CACHE = df
+        print(f"   ✅ 同花顺概念资金流 {len(df)} 个概念")
+        return _CONCEPT_FUNDFLOW_CACHE
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  概念资金流失败: {e}")
+        return None
+
+
+def fetch_industry_fundflow(use_mock: bool = False) -> Optional[pd.DataFrame]:
+    """同花顺行业资金流（90 个行业，按净流入排序）。"""
+    global _INDUSTRY_FUNDFLOW_CACHE, _INDUSTRY_FUNDFLOW_TRIED
+    if _INDUSTRY_FUNDFLOW_TRIED:
+        return _INDUSTRY_FUNDFLOW_CACHE
+    _INDUSTRY_FUNDFLOW_TRIED = True
+    if use_mock:
+        _INDUSTRY_FUNDFLOW_CACHE = pd.DataFrame([
+            {"行业": "元件", "行业-涨跌幅": 4.5, "净额": 35.2, "公司家数": 62, "领涨股": "达利凯普", "领涨股-涨跌幅": 12.0},
+            {"行业": "电子化学品", "行业-涨跌幅": 3.8, "净额": 22.1, "公司家数": 42, "领涨股": "天承科技", "领涨股-涨跌幅": 9.5},
+            {"行业": "白酒", "行业-涨跌幅": 1.2, "净额": 8.5, "公司家数": 18, "领涨股": "贵州茅台", "领涨股-涨跌幅": 2.0},
+        ])
+        return _INDUSTRY_FUNDFLOW_CACHE
+    try:
+        import akshare as ak
+        df = ak.stock_fund_flow_industry(symbol="即时")
+        if df is None or df.empty:
+            return None
+        df["净额"] = pd.to_numeric(df["净额"], errors="coerce").fillna(0)
+        df = df.sort_values("净额", ascending=False).reset_index(drop=True)
+        _INDUSTRY_FUNDFLOW_CACHE = df
+        print(f"   ✅ 同花顺行业资金流 {len(df)} 个行业")
+        return _INDUSTRY_FUNDFLOW_CACHE
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  行业资金流失败: {e}")
+        return None
+
+
+def fetch_zt_pool(use_mock: bool = False) -> Optional[pd.DataFrame]:
+    """昨日涨停池（东方财富，含连板高度、所属行业、封板时间）。
+
+    返回字段含: 代码, 名称, 涨跌幅, 最新价, 成交额, 流通市值, 总市值, 换手率, 封板资金,
+               首次封板时间, 最后封板时间, 炸板次数, 涨停统计, 连板数, 所属行业
+    """
+    global _ZT_POOL_CACHE, _ZT_POOL_TRIED
+    if _ZT_POOL_TRIED:
+        return _ZT_POOL_CACHE
+    _ZT_POOL_TRIED = True
+    if use_mock:
+        _ZT_POOL_CACHE = pd.DataFrame([
+            {"代码": "603065", "名称": "宿迁联盛", "连板数": 4, "涨停统计": "8/5", "所属行业": "化学制品", "换手率": 12.5},
+            {"代码": "000768", "名称": "中航西飞", "连板数": 1, "涨停统计": "1/1", "所属行业": "航空装备", "换手率": 3.5},
+            {"代码": "601958", "名称": "金钼股份", "连板数": 2, "涨停统计": "2/2", "所属行业": "小金属", "换手率": 5.8},
+        ])
+        return _ZT_POOL_CACHE
+    try:
+        import akshare as ak
+        # 取昨天作为涨停日（A 股盘前推送，今日涨停还没产生）
+        for offset in range(1, 6):
+            d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
+            try:
+                df = ak.stock_zt_pool_em(date=d)
+            except Exception:
+                df = None
+            if df is not None and not df.empty:
+                _ZT_POOL_CACHE = df
+                print(f"   ✅ 涨停池 {d} {len(df)} 只")
+                return _ZT_POOL_CACHE
+        print("   ⚠️  涨停池近 5 天无数据")
+        return None
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  涨停池失败: {e}")
+        return None
+
+
+def fetch_lhb_detail(use_mock: bool = False) -> Optional[pd.DataFrame]:
+    """昨日龙虎榜详情。
+
+    返回字段含: 代码, 名称, 上榜日, 解读, 收盘价, 涨跌幅, 龙虎榜净买额, 龙虎榜买入额,
+               龙虎榜卖出额, 净买额占总成交比, 上榜原因, 上榜后1日/2日/5日/10日
+    """
+    global _LHB_DETAIL_CACHE, _LHB_DETAIL_TRIED
+    if _LHB_DETAIL_TRIED:
+        return _LHB_DETAIL_CACHE
+    _LHB_DETAIL_TRIED = True
+    if use_mock:
+        _LHB_DETAIL_CACHE = pd.DataFrame([
+            {"代码": "603065", "名称": "宿迁联盛", "解读": "知名游资买入",
+             "龙虎榜净买额": 2.5e8, "上榜原因": "日涨幅偏离值达7%"},
+            {"代码": "000768", "名称": "中航西飞", "解读": "机构买入",
+             "龙虎榜净买额": 1.2e8, "上榜原因": "日涨幅偏离值达7%"},
+        ])
+        return _LHB_DETAIL_CACHE
+    try:
+        import akshare as ak
+        for offset in range(1, 6):
+            d = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
+            try:
+                df = ak.stock_lhb_detail_em(start_date=d, end_date=d)
+            except Exception:
+                df = None
+            if df is not None and not df.empty:
+                _LHB_DETAIL_CACHE = df
+                print(f"   ✅ 龙虎榜 {d} {len(df)} 行")
+                return _LHB_DETAIL_CACHE
+        print("   ⚠️  龙虎榜近 5 天无数据")
+        return None
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  龙虎榜失败: {e}")
+        return None
+
+
+def get_stock_market_signals(code: str, use_mock: bool = False) -> dict:
+    """汇总单只股票的市场情绪信号：涨停连板数、是否上龙虎榜+净买额。
+
+    所有数据来自全市场缓存，首次调用时触发拉取，之后 O(1) 查询。
+    """
+    out = {
+        "zt_streak": 0,        # 连板数 (来自 zt_pool 的"连板数"列)
+        "lhb_net_buy": None,   # 龙虎榜净买额 (元),正数=游资/机构净买入
+    }
+    code6 = str(code).zfill(6)
+
+    zt = fetch_zt_pool(use_mock=use_mock)
+    if zt is not None and not zt.empty and "代码" in zt.columns:
+        row = zt[zt["代码"].astype(str).str.zfill(6) == code6]
+        if not row.empty:
+            try:
+                out["zt_streak"] = int(row.iloc[0].get("连板数", 0) or 0)
+            except (ValueError, TypeError):
+                out["zt_streak"] = 0
+
+    lhb = fetch_lhb_detail(use_mock=use_mock)
+    if lhb is not None and not lhb.empty and "代码" in lhb.columns:
+        row = lhb[lhb["代码"].astype(str).str.zfill(6) == code6]
+        if not row.empty:
+            try:
+                # 同一只股票可能上榜多行(同日多个原因),取累计净买
+                out["lhb_net_buy"] = float(row["龙虎榜净买额"].fillna(0).sum())
+            except Exception:
+                pass
+
+    return out
