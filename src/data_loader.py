@@ -405,37 +405,94 @@ def _mock_industry_cons(industry: str) -> pd.DataFrame:
 
 
 @_retry()
+def _sina_spot_inner() -> Optional[pd.DataFrame]:
+    """新浪全市场快照（直连 HTTP，不用 akshare，海外友好）。
+
+    新浪完整API比akshare的 stock_zh_a_spot() 多 PE/PB/市值/换手率字段。
+    Sina 分页限制每页 100 条，循环翻页取全量。
+    返回 DataFrame: 代码, 名称, 最新价, 涨跌幅, 成交额, 总市值, 市净率, 换手率, 市盈率
+    失败返回 None。
+    """
+    import json as _json
+    try:
+        all_stocks = []
+        page = 1
+        while True:
+            url = ("https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+                   "Market_Center.getHQNodeData?page={}&num=100&sort=changepercent"
+                   "&asc=0&node=hs_a&symbol=&_s_r_a=page".format(page))
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            resp = urllib.request.urlopen(req, timeout=30)
+            raw = resp.read().decode("gbk")
+            page_stocks = _json.loads(raw)
+            if not page_stocks:
+                break
+            all_stocks.extend(page_stocks)
+            if len(page_stocks) < 100:
+                break
+            page += 1
+
+        if not all_stocks:
+            return None
+
+        rows = []
+        for s in all_stocks:
+            code = str(s.get("code", "") or s.get("symbol", ""))
+            code = code.replace("sh", "").replace("sz", "").replace("bj", "")
+            name = s.get("name", "")
+            trade = float(s.get("trade", 0) or 0)
+            chg = float(s.get("changepercent", 0) or 0)
+            amount = float(s.get("amount", 0) or 0)
+            mktcap = float(s.get("mktcap", 0) or 0) * 1e4
+            pb = float(s.get("pb", 0) or 0)
+            turnover = float(s.get("turnoverratio", 0) or 0)
+            pe = float(s.get("per", 0) or 0)
+            rows.append({
+                "代码": code, "名称": name, "最新价": trade,
+                "涨跌幅": chg, "成交额": amount, "总市值": mktcap,
+                "市净率": pb, "换手率": turnover, "市盈率": pe,
+            })
+
+        df = pd.DataFrame(rows)
+        print(f"   ✅ 新浪全市场快照 {len(df)} 只 ({page} 页)")
+        return df
+    except Exception as e:
+        print(f"   ⚠️  新浪全市场API失败: {e}")
+        return None
+
+
 def fetch_spot(use_mock: bool = False) -> pd.DataFrame:
     """全市场 A 股快照。
 
-    推荐通道（新）: Tushare daily_basic + market_window 聚合（海外稳定）
-    回退通道 1（旧）: 东方财富 (stock_zh_a_spot_em)
-    回退通道 2（旧）: 新浪 (stock_zh_a_spot)
+    通道 1（推荐）: 新浪直连（HTTP 不限IP，含PE/PB/市值/换手率）
+    通道 2（保留）: Tushare daily_basic + market_window 聚合
+    通道 3（回退）: akshare 新浪源
 
-    返回 DataFrame，列：代码, 名称, 最新价, 涨跌幅, 成交额, 总市值, 换手率
+    返回 DataFrame，列：代码, 名称, 最新价, 涨跌幅, 成交额, 总市值, 市净率, 换手率
     """
     if use_mock:
         return _mock_spot()
 
-    # 推荐通道: Tushare daily_basic + market_window 聚合
+    # 通道 1: 新浪直连（不限IP，海外友好，字段全）
+    sina_df = _sina_spot_inner()
+    if sina_df is not None and not sina_df.empty:
+        return sina_df
+
+    # 通道 2: Tushare daily_basic + market_window 聚合
     db = fetch_daily_basic_market(use_mock=False)
     window = fetch_market_window(days=6, use_mock=False)
     if db is not None and not db.empty and window is not None and not window.empty:
         try:
-            # db 有 total_mv(总市值), circ_mv, pe_ttm, pb, turnover_rate
-            # window 有 close_now(最新收盘), chg_5d(5日涨幅), amount_now(成交额千元)
             merged = db.merge(window, on="ts_code", how="inner")
-            # 用统一的 stock_basic 缓存获取名称（避免重复调用 Tushare）
             name_map = _get_stock_basic_names()
-            # 标准化列名
             rows = []
             for _, r in merged.iterrows():
                 ts_code = str(r.get("ts_code", ""))
                 code = ts_code.split(".")[0]
                 name = name_map.get(code, "")
                 close = float(r.get("close_now", 0) or 0)
-                chg = float(r.get("chg_5d", 0) or 0)  # 5日涨幅 ≈ 当日涨跌幅代理
-                amount = float(r.get("amount_now", 0) or 0) * 1000  # 千元→元
+                chg = float(r.get("chg_5d", 0) or 0)
+                amount = float(r.get("amount_now", 0) or 0) * 1000
                 total_mv = float(r.get("total_mv", 0) or 0)
                 pb = float(r.get("pb", 0) or 0) if pd.notna(r.get("pb")) else 0
                 turnover = float(r.get("turnover_rate", 0) or 0) if pd.notna(r.get("turnover_rate")) else 0
@@ -449,21 +506,10 @@ def fetch_spot(use_mock: bool = False) -> pd.DataFrame:
                 print(f"   ✅ Tushare 聚合全市场快照 {len(df)} 只")
                 return df
         except Exception as e:
-            print(f"   ⚠️  Tushare 聚合快照失败: {e}, 回退 akshare")
+            print(f"   ⚠️  Tushare 聚合快照失败: {e}")
 
-    # 回退通道 1: 东方财富 (akshare)
+    # 通道 3: akshare 新浪源（最终 fallback）
     import akshare as ak
-    try:
-        df = ak.stock_zh_a_spot_em()
-        if df is not None and not df.empty:
-            # 添加换手率列(如果存在)
-            if "换手率" in df.columns:
-                df = df.rename(columns={"换手率": "换手率"})
-            return df
-    except Exception as e:  # noqa: BLE001
-        print(f"   ⚠️  东方财富快照失败: {e}, 回退新浪源")
-
-    # 回退通道 2: 新浪源
     df = ak.stock_zh_a_spot()
     rename_map = {
         "symbol": "代码", "code": "代码", "name": "名称", "trade": "最新价",
