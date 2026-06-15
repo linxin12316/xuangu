@@ -1,9 +1,10 @@
-"""主入口：盘前选股 / 盘后复盘。
+"""主入口：盘前选股 / 盘后复盘 / 晚间复盘。
 
 用法：
-  python -m src.main pick           # 真实选股 + 推送
+  python -m src.main pick           # 盘前选股 + 推送（08:27）
   python -m src.main pick --dry-run # 离线 mock 跑一遍
-  python -m src.main review         # 盘后复盘
+  python -m src.main review         # 盘后复盘（16:07，对比候选当日表现）
+  python -m src.main evening        # 晚间深度复盘 + 明日 Top 3 候选（18:23）
 """
 from __future__ import annotations
 
@@ -27,19 +28,24 @@ from .scoring import score_one
 PICKS_DIR = Path(__file__).resolve().parent.parent / "picks"
 
 
-# ---------- pick ----------
+# ---------- 共用：跑完整选股流程 ----------
 
 
-def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
-    if not dry_run and not force and not dl.is_trading_day():
-        print("⏸️  今日非交易日，跳过推送")
-        return 0
+def _run_full_pipeline(dry_run: bool, top_n: int, override_max_picks: bool = False):
+    """完整跑一遍 spot → 行业/资金流 → 候选池 → 打分 → 同行业去重。
 
+    返回 dict 含: picks, industries, concept_ff, industry_ff, zt_pool, lhb_detail,
+    risk_score, risk_desc, north_market_flow, streak_map, cfg。
+    供 cmd_pick / cmd_evening 共用。
+
+    override_max_picks=True 时，忽略 cfg["max_picks"]，强制用入参 top_n（evening 用）。
+    """
     cfg = load_config()
     print(f"📋 配置：黑名单 {len(cfg['blacklist']['codes'])} 代码 / "
           f"{len(cfg['blacklist']['name_keywords'])} 关键词，"
           f"同行业上限 {cfg['max_per_industry']}，Top {cfg['max_picks']}")
-    top_n = cfg.get("max_picks", top_n)
+    if not override_max_picks:
+        top_n = cfg.get("max_picks", top_n)
 
     print("📥 拉取全市场快照…")
     spot = dl.fetch_spot(use_mock=dry_run)
@@ -51,38 +57,19 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     spot = apply_blacklist(spot, cfg["blacklist"])
     print(f"   过滤黑名单后剩 {len(spot)} 只")
 
-    # 行业映射（Tushare stock_basic，免费可用）
     industry_map = dl.fetch_industry_map(use_mock=dry_run)
-
-    # 全市场近 5 日涨幅快照（Tushare daily by trade_date，免费可用）
     market_window = dl.fetch_market_window(days=6, use_mock=dry_run)
 
     print("📥 计算强势板块（行业平均5日涨幅）…")
-    # 取 Top 8 热门行业(给后面留够个股筛选空间)
     industries = dl.fetch_industry_rank(top_n=8, use_mock=dry_run)
-    if not industries.empty:
-        members_col = "成员数" if "成员数" in industries.columns else None
-        info = industries['板块名称'].tolist()
-        if members_col:
-            info = [f"{n}({c}只)" for n, c in zip(industries['板块名称'], industries[members_col])]
-        print(f"   Top 8 热门行业: {info}")
-    else:
-        print("   ⚠️  板块接口不可用，降级为全市场涨幅排序")
 
-    # 同花顺资金流（海外稳定）：行业资金流 Top N + 概念资金流（仅展示）
     print("📥 拉取同花顺资金流（行业 + 概念）…")
     industry_ff = dl.fetch_industry_fundflow(use_mock=dry_run)
     concept_ff = dl.fetch_concept_fundflow(use_mock=dry_run)
     fundflow_top_industries: set[str] = set()
     if industry_ff is not None and not industry_ff.empty:
-        # 取净流入 Top 6 作为"主力青睐"行业
         fundflow_top_industries = set(industry_ff.head(6)["行业"].tolist())
-        print(f"   💰 行业资金流 Top 6: {list(fundflow_top_industries)}")
-    if concept_ff is not None and not concept_ff.empty:
-        top_concepts = concept_ff.head(5)["行业"].tolist()
-        print(f"   💡 概念资金流 Top 5: {top_concepts}")
 
-    # 构建 spot_map + turnover_map
     name_col = "名称" if "名称" in spot.columns else spot.columns[1]
     spot_map = {str(r["代码"]).zfill(6): r[name_col] for _, r in spot.iterrows()}
     turn_col = next((c for c in spot.columns if "换手" in c), None)
@@ -95,19 +82,14 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
             except (ValueError, TypeError):
                 pass
 
-    candidate_codes: dict[str, str] = {}  # code -> industry
-    # 路径 A: 行业择强（趋势 ∪ 资金流）+ 个股趋势双重筛选
+    candidate_codes: dict[str, str] = {}
     trend_industries = set(industries["板块名称"].tolist()) if not industries.empty else set()
-    hot_industries = trend_industries | fundflow_top_industries  # 双轨取并集
+    hot_industries = trend_industries | fundflow_top_industries
     if hot_industries and market_window is not None and not market_window.empty:
-        # 1) 给所有股票打上行业标签
         df = market_window.copy()
         df["industry"] = df["code"].map(industry_map)
-        # 2) 只保留热门行业的股票
         df = df[df["industry"].isin(hot_industries)]
-        # 3) 股票必须在 spot_map 里(能拿到现价/换手率)且未被黑名单/地雷股过滤掉
         df = df[df["code"].isin(spot_map.keys())]
-        # 4) 按个股 5 日涨幅 + 成交额加权排序,取 Top 200
         if not df.empty:
             df["__rank"] = (
                 df["chg_5d"].fillna(0).rank(pct=True) * 0.6
@@ -116,16 +98,9 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
             df = df.sort_values("__rank", ascending=False).head(200)
             for _, r in df.iterrows():
                 candidate_codes[r["code"]] = r["industry"]
-            src = []
-            if trend_industries: src.append(f"趋势{len(trend_industries)}")
-            if fundflow_top_industries: src.append(f"资金{len(fundflow_top_industries)}")
-            print(f"   ✅ 热门行业候选池 {len(candidate_codes)} 只 (来源:{'+'.join(src)})")
 
-    # 降级路径
     if not candidate_codes:
-        # 优先用 market_window 的真 5 日涨幅
         if market_window is not None and not market_window.empty:
-            print("   📥 退化方案 A：全市场近5日涨幅+成交额 Top 200")
             df = market_window.copy()
             df = df[df["code"].isin(spot_map.keys())]
             if not df.empty:
@@ -138,8 +113,6 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
                     candidate_codes[r["code"]] = industry_map.get(r["code"], "全市场")
 
     if not candidate_codes:
-        # 最差降级:用 spot 单日数据
-        print("   📥 退化方案 B：用 spot 当日涨幅+成交额 Top 200 作为候选池")
         sorted_spot = spot.copy()
         if "涨跌幅" in sorted_spot.columns and "成交额" in sorted_spot.columns:
             sorted_spot["__rank"] = (
@@ -149,37 +122,25 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
             sorted_spot = sorted_spot.sort_values("__rank", ascending=False)
         for _, r in sorted_spot.head(200).iterrows():
             code = str(r["代码"]).zfill(6)
-            # 用 Tushare 行业映射;查不到时回退"全市场"
             candidate_codes[code] = industry_map.get(code, "全市场")
 
     print(f"   候选池 {len(candidate_codes)} 只")
 
-    # --- 大盘风险评级 ---
     risk_score, risk_desc = _market_risk(dry_run=dry_run)
-    if risk_score <= 2:
-        msg = f"⚠️ 今日大盘风险评分 {risk_score}/10：{risk_desc}，跳过选股推送"
-        print(f"   {msg}")
-        if not dry_run:
-            send_to_wechat(f"⏸️ 选股暂停 {datetime.now().strftime('%m-%d')}", f"# {msg}\n\n大盘风险过高，今日不推送候选。")
-        return 0
 
-    # --- 资金维度（全市场北向净流入） ---
     north_market_flow = _fetch_north_market_flow(dry_run=dry_run)
     if north_market_flow is not None:
         print(f"   💰 北向资金净流入 {north_market_flow:+.1f} 亿")
 
-    # --- 预热 Tushare 全市场缓存（每天调一次,用于新因子）---
     print("📥 预热 Tushare 全市场缓存（北向/估值/涨停）…")
     dl.fetch_hk_hold_market(use_mock=dry_run)
     dl.fetch_daily_basic_market(use_mock=dry_run)
     dl.fetch_limit_list_market(use_mock=dry_run)
 
-    # --- 预热涨停池 + 龙虎榜缓存（akshare 同花顺/东财源,海外可用）---
     print("📥 预热涨停池 + 龙虎榜缓存…")
     dl.fetch_zt_pool(use_mock=dry_run)
     dl.fetch_lhb_detail(use_mock=dry_run)
 
-    # --- 并发打分 ---
     print(f"📥 并发拉取日线 + 打分（{len(candidate_codes)} 只）…")
     scored = list(_score_candidates_concurrent(
         candidate_codes, spot_map, dry_run,
@@ -187,31 +148,63 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
         turnover_map=turnover_map,
     ))
 
-    # --- 连续上榜惩罚 ---
     streak_map = _compute_streak(scored)
     scored = _adjust_for_repeats(scored, streak_map)
-
     scored.sort(key=lambda x: x.total, reverse=True)
-    # --- 同行业去重（Top 5 中同一行业最多保留 N 只）---
+
     deduped = dedup_by_industry(scored, max_per_industry=cfg["max_per_industry"])
     if len(deduped) < len(scored):
         print(f"   🧹 同行业去重：{len(scored)} → {len(deduped)} (上限 {cfg['max_per_industry']}/行业)")
     picks = deduped[:top_n]
+    streak_map = _compute_streak(picks)
+
+    return {
+        "picks": picks,
+        "industries": industries,
+        "concept_ff": concept_ff,
+        "industry_ff": industry_ff,
+        "zt_pool": dl.fetch_zt_pool(use_mock=dry_run),
+        "lhb_detail": dl.fetch_lhb_detail(use_mock=dry_run),
+        "risk_score": risk_score,
+        "risk_desc": risk_desc,
+        "north_market_flow": north_market_flow,
+        "streak_map": streak_map,
+        "cfg": cfg,
+        "spot_map": spot_map,
+    }
+
+
+# ---------- pick ----------
+
+
+def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
+    if not dry_run and not force and not dl.is_trading_day():
+        print("⏸️  今日非交易日，跳过推送")
+        return 0
+
+    ctx = _run_full_pipeline(dry_run=dry_run, top_n=top_n)
+    picks = ctx["picks"]
+    risk_score = ctx["risk_score"]
+
+    if risk_score <= 2:
+        msg = f"⚠️ 今日大盘风险评分 {risk_score}/10：{ctx['risk_desc']}，跳过选股推送"
+        print(f"   {msg}")
+        if not dry_run:
+            send_to_wechat(f"⏸️ 选股暂停 {datetime.now().strftime('%m-%d')}", f"# {msg}\n\n大盘风险过高，今日不推送候选。")
+        return 0
 
     print(f"\n🏆 Top {len(picks)}:")
     for i, s in enumerate(picks, 1):
         print(f"   {i}. {s.code} {s.name} ({s.industry}) 综合 {s.total:.1f}")
 
-    streak_map = _compute_streak(picks)
-
     md = rpt.render_pick_report(
-        industries, picks, streak_map=streak_map,
-        risk_score=risk_score, risk_desc=risk_desc,
-        north_flow=north_market_flow,
-        concept_fundflow=concept_ff,
-        industry_fundflow=industry_ff,
-        zt_pool=dl.fetch_zt_pool(use_mock=dry_run),
-        lhb_detail=dl.fetch_lhb_detail(use_mock=dry_run),
+        ctx["industries"], picks, streak_map=ctx["streak_map"],
+        risk_score=risk_score, risk_desc=ctx["risk_desc"],
+        north_flow=ctx["north_market_flow"],
+        concept_fundflow=ctx["concept_ff"],
+        industry_fundflow=ctx["industry_ff"],
+        zt_pool=ctx["zt_pool"],
+        lhb_detail=ctx["lhb_detail"],
     )
 
     if dry_run:
@@ -220,7 +213,6 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
         print("=" * 60)
         return 0
 
-    # 落盘候选清单（供盘后复盘使用）
     today = datetime.now().strftime("%Y-%m-%d")
     PICKS_DIR.mkdir(exist_ok=True)
     pick_file = PICKS_DIR / f"{today}.json"
@@ -231,6 +223,64 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     print(f"💾 候选清单已保存到 {pick_file}")
 
     title = f"📈 选股报告 {today}"
+    ok = send_to_wechat(title, md)
+    return 0 if ok else 1
+
+
+# ---------- evening (晚间深度复盘 + 明日候选) ----------
+
+
+def cmd_evening(dry_run: bool = False, force: bool = False) -> int:
+    """盘后 18:23 全数据已稳定时跑：
+
+    内容包含：今日大盘 / 热门概念 / 行业资金流 / 涨停梯队 / 龙虎榜净买
+    + 明日 Top 3 候选 (含买点止损)。
+
+    与 daily-pick 的区别：
+    - 时间：18:23 而非 8:27 → 数据是收盘后稳定版
+    - 内容：明日候选 + 今日深度复盘合一
+    - 不写 picks/ 文件（不参与回测，避免和盘前 picks 混淆）
+    """
+    if not dry_run and not force and not dl.is_trading_day():
+        print("⏸️  今日非交易日，跳过晚间复盘")
+        return 0
+
+    ctx = _run_full_pipeline(dry_run=dry_run, top_n=3, override_max_picks=True)
+    picks = ctx["picks"]
+
+    if not picks:
+        if not dry_run:
+            send_to_wechat(
+                f"⚠️ 晚间复盘 {datetime.now().strftime('%m-%d')}",
+                "# 今日候选为空\n\n所有数据源均未返回有效候选，请检查 Actions 日志。",
+            )
+        return 1
+
+    print(f"\n🏆 明日 Top {len(picks)}:")
+    for i, s in enumerate(picks, 1):
+        print(f"   {i}. {s.code} {s.name} ({s.industry}) 综合 {s.total:.1f}")
+
+    md = rpt.render_evening_report(
+        picks=picks,
+        industries=ctx["industries"],
+        concept_ff=ctx["concept_ff"],
+        industry_ff=ctx["industry_ff"],
+        zt_pool=ctx["zt_pool"],
+        lhb_detail=ctx["lhb_detail"],
+        risk_score=ctx["risk_score"],
+        risk_desc=ctx["risk_desc"],
+        north_flow=ctx["north_market_flow"],
+        streak_map=ctx["streak_map"],
+    )
+
+    if dry_run:
+        print("\n" + "=" * 60)
+        print(md)
+        print("=" * 60)
+        return 0
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    title = f"🌙 晚间复盘 {today}"
     ok = send_to_wechat(title, md)
     return 0 if ok else 1
 
@@ -475,8 +525,12 @@ def main(argv=None) -> int:
     p_pick.add_argument("--top", type=int, default=5)
     p_pick.add_argument("--force", action="store_true", help="非交易日也强制运行（验证用）")
 
-    p_rev = sub.add_parser("review", help="盘后复盘")
+    p_rev = sub.add_parser("review", help="盘后复盘（对比候选当日表现）")
     p_rev.add_argument("--dry-run", action="store_true")
+
+    p_eve = sub.add_parser("evening", help="晚间深度复盘 + 明日 Top 3 候选")
+    p_eve.add_argument("--dry-run", action="store_true")
+    p_eve.add_argument("--force", action="store_true", help="非交易日也强制运行")
 
     args = parser.parse_args(argv)
     try:
@@ -484,6 +538,8 @@ def main(argv=None) -> int:
             return cmd_pick(dry_run=args.dry_run, top_n=args.top, force=args.force)
         if args.cmd == "review":
             return cmd_review(dry_run=args.dry_run)
+        if args.cmd == "evening":
+            return cmd_evening(dry_run=args.dry_run, force=args.force)
     except Exception as e:  # noqa: BLE001
         # 任何崩溃都推送一条微信提醒，避免静默失败
         import traceback
