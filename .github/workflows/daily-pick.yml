@@ -38,6 +38,7 @@ jobs:
       - name: Run pick
         env:
           SCKEY: ${{ secrets.SCKEY }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
           TZ: Asia/Shanghai
         run: |
           if [ "${{ inputs.force }}" = "true" ]; then
