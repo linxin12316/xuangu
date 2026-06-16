@@ -20,6 +20,7 @@ import pandas as pd
 from . import data_loader as dl
 from . import filters as flt
 from . import report as rpt
+from . import theme_scorer as ts
 from .config import load_config, apply_blacklist, dedup_by_industry
 from .notifier import send_to_wechat
 from .scoring import score_one
@@ -207,6 +208,15 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
         lhb_detail=ctx["lhb_detail"],
     )
 
+    # 题材热度榜（独立模块，失败不影响主推送）
+    try:
+        theme_ranks = ts.rank_themes()
+        theme_md = ts.render_theme_section(theme_ranks, top_n=10)
+        if theme_md:
+            md = md + "\n\n" + theme_md
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  题材热度榜计算失败: {e}")
+
     if dry_run:
         print("\n" + "=" * 60)
         print(md)
@@ -272,6 +282,15 @@ def cmd_evening(dry_run: bool = False, force: bool = False) -> int:
         north_flow=ctx["north_market_flow"],
         streak_map=ctx["streak_map"],
     )
+
+    # 题材热度榜（独立模块，失败不影响主推送）
+    try:
+        theme_ranks = ts.rank_themes()
+        theme_md = ts.render_theme_section(theme_ranks, top_n=10)
+        if theme_md:
+            md = md + "\n\n" + theme_md
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  题材热度榜计算失败: {e}")
 
     if dry_run:
         print("\n" + "=" * 60)
@@ -467,7 +486,36 @@ def _score_candidates_concurrent(
     turnover_map: dict[str, float] | None = None,
     max_workers: int = 8,
 ) -> list:
-    """并发拉取日线并打分。"""
+    """并发拉取日线并打分。
+
+    新增：腾讯行情批量预拉（量比/实时PE/实时换手）
+          + 东财资金流批量预拉（主力净流入）
+    从股票行情分析项目引入的直连数据源。
+    """
+    code_list = list(candidate_codes.keys())
+
+    # 批量预拉腾讯实时行情（海外友好，不封IP）
+    print("   📡 批量拉取腾讯实时行情（量比/PE/市值）…")
+    tencent_enrich: dict = {}
+    if not dry_run:
+        try:
+            tencent_enrich = dl.enrich_with_tencent(code_list)
+            if tencent_enrich:
+                print(f"      ✅ 腾讯行情 {len(tencent_enrich)} 只")
+        except Exception:
+            pass
+
+    # 批量预拉东财资金流（主力净流入，节流防封）
+    print("   💰 批量拉取东财资金流（主力净流入）…")
+    fundflow_enrich: dict = {}
+    if not dry_run:
+        try:
+            fundflow_enrich = dl.enrich_with_fundflow(code_list[:60])  # 只查前60只节省配额
+            if fundflow_enrich:
+                print(f"      ✅ 资金流 {len(fundflow_enrich)} 只")
+        except Exception:
+            pass
+
     def _work(code: str, industry: str):
         try:
             kline = dl.fetch_kline(code, days=80, use_mock=dry_run)
@@ -475,21 +523,39 @@ def _score_candidates_concurrent(
             to = turnover_map.get(code) if turnover_map else None
             factors = dl.get_stock_factors(code, use_mock=dry_run)
             signals = dl.get_stock_market_signals(code, use_mock=dry_run)
+
             # turnover 优先用 spot 当日值,缺失时回退 Tushare 上一交易日值
             if to is None and factors.get("turnover_rate") is not None:
                 to = factors["turnover_rate"]
+            # 再回退腾讯实时换手率
+            if to is None and code in tencent_enrich:
+                to = tencent_enrich[code].get("turnover_pct")
+
+            # PE/PB 优先用腾讯实时值（比 Tushare daily_basic 更新鲜）
+            pe = factors.get("pe_ttm")
+            pb = factors.get("pb")
+            if code in tencent_enrich:
+                tq = tencent_enrich[code]
+                if tq.get("pe_ttm", 0) > 0:
+                    pe = tq["pe_ttm"]
+                if tq.get("pb", 0) > 0:
+                    pb = tq["pb"]
+
             s = score_one(
                 code, spot_map[code], industry, kline, north,
                 north_market_flow=north_market_flow,
                 turnover_rate=to,
                 zt_streak=signals.get("zt_streak", 0),
                 limit_times_10d=factors.get("limit_times_10d", 0) or 0,
-                pe_ttm=factors.get("pe_ttm"),
-                pb=factors.get("pb"),
+                pe_ttm=pe,
+                pb=pb,
                 lhb_net_buy=signals.get("lhb_net_buy"),
                 roe=None,             # 需 2000 积分,暂中性
                 profit_growth=None,   # 需 2000 积分,暂中性
             )
+            # 将资金流数据挂到 Score 对象上供报告使用
+            if s and code in fundflow_enrich:
+                s.fund_flow = fundflow_enrich[code]
             return s
         except Exception as e:  # noqa: BLE001
             print(f"   ⚠️  {code} 打分失败: {e}")
