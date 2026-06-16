@@ -233,8 +233,79 @@ def test_score_one_returns_all_dimensions():
     )
     d = score.as_dict()
     for k in ("trend", "volume", "momentum", "fund", "safety", "turnover",
-              "limit_up", "valuation", "longhu", "finance", "total"):
+              "limit_up", "valuation", "longhu", "finance",
+              "technical_signal", "factor_score", "total"):
         assert k in d, f"as_dict 缺字段 {k}"
+
+
+# ---------- 技术信号测试 ----------
+
+
+def test_technical_score_full():
+    """健康的多头 K 线应得到较高技术信号分。"""
+    np.random.seed(42)
+    n = 80
+    base = 50.0
+    trend = np.linspace(0, 0.3, n)
+    noise = np.random.normal(0, 0.008, n)
+    closes = base * (1 + trend + noise.cumsum() * 0.15)
+    closes = closes.clip(min=1.0)
+    highs = closes * 1.02
+    lows = closes * 0.98
+    volumes = np.linspace(1e7, 2e7, n)  # 递增放量
+    kline = pd.DataFrame({
+        "收盘": closes, "最高": highs, "最低": lows, "成交量": volumes,
+    })
+    from src.technical_signals import compute_technical_score
+    sig = compute_technical_score(kline)
+    assert sig.get("composite_signal", 0) > 5, f"多头趋势技术信号应 >5，实得 {sig}"
+    assert sig.get("adx_trend", 0) > 0
+    assert sig.get("obv_trend", 0) > 0
+
+
+def test_technical_score_insufficient_data():
+    kline = pd.DataFrame({"收盘": [50.0] * 10, "最高": [51.0] * 10, "最低": [49.0] * 10, "成交量": [1e7] * 10})
+    from src.technical_signals import compute_technical_score
+    sig = compute_technical_score(kline)
+    for k, v in sig.items():
+        assert v == 0.0, f"数据不足时 {k} 应为 0，实得 {v}"
+
+
+# ---------- 截面因子测试 ----------
+
+
+def test_zscore_cross_section():
+    vals = {"a": 100.0, "b": 50.0, "c": 0.0}
+    zs = scoring.zscore_cross_section(vals)
+    assert abs(zs["a"] - zs["c"]) > 1, "极值 Z-score 差距应 > 1"
+    assert abs(zs["b"]) < 0.5, "中位值 Z-score 应接近 0"
+
+
+def test_zscore_too_few():
+    vals = {"a": 100.0, "b": 50.0}
+    zs = scoring.zscore_cross_section(vals)
+    assert zs["a"] == 0.0 and zs["b"] == 0.0, "不足 3 个样本应全 0"
+
+
+def test_score_factor_zscore():
+    assert scoring.score_factor_zscore(2.0) == 6.0, "z>=1.5 应满分"
+    assert scoring.score_factor_zscore(0.0) == 3.0, "z 中性应 3 分"
+    assert scoring.score_factor_zscore(-2.0) == 0.0, "z 极低应 0 分"
+    assert scoring.score_factor_zscore(None) == 3.0, "无数据应中性"
+
+
+# ---------- 技术信号评分函数测试 ----------
+
+
+def test_score_technical():
+    sig = {"adx_trend": 10, "adx_direction": 8, "bb_position": 6, "rsi_position": 7, "obv_trend": 9,
+           "composite_signal": 8.0}
+    s = scoring.score_technical(sig)
+    assert s == 8.0, f"composite=8 应得 8 分，实得 {s}"
+
+
+def test_score_technical_empty():
+    assert scoring.score_technical({}) == 0.0
 
 
 if __name__ == "__main__":
