@@ -127,6 +127,18 @@ def _run_full_pipeline(dry_run: bool, top_n: int, override_max_picks: bool = Fal
 
     print(f"   候选池 {len(candidate_codes)} 只")
 
+    # 题材池硬过滤：候选池 ∩ (themes.json 全部代码 ∪ 今日强势股命中的代码)
+    # 用户偏好：只推 AI/资源主线相关的票，不推券商保险公用事业
+    theme_pool = _build_theme_pool()
+    if theme_pool:
+        before = len(candidate_codes)
+        filtered = {c: ind for c, ind in candidate_codes.items() if c in theme_pool}
+        if filtered:
+            candidate_codes = filtered
+            print(f"   🎯 题材池过滤：{before} → {len(candidate_codes)} (themes.json + 强势股命中)")
+        else:
+            print(f"   ⚠️  题材池过滤后候选为空（{before} → 0），保留原候选池")
+
     risk_score, risk_desc = _market_risk(dry_run=dry_run)
 
     north_market_flow = _fetch_north_market_flow(dry_run=dry_run)
@@ -350,6 +362,33 @@ def cmd_review(dry_run: bool = False) -> int:
 
 
 # ---------- helpers ----------
+
+
+def _build_theme_pool() -> set[str]:
+    """构建题材白名单池：themes.json 全部代码 ∪ 今日同花顺强势股 reason 命中题材 keyword 的代码。
+
+    返回 set of 6 位代码字符串。失败/为空时返回 set()，调用方需做兜底。
+    """
+    pool: set[str] = set()
+
+    # 1) themes.json 静态池
+    themes = ts.load_themes()
+    for t in themes:
+        for c in t.get("codes", []):
+            pool.add(str(c).zfill(6))
+
+    # 2) 同花顺今日强势股里命中题材 keyword 的代码（动态扩充）
+    try:
+        strong_index = ts._build_strong_index()
+        for t in themes:
+            keywords = t.get("keywords") or []
+            _, hits = ts._theme_hit_score(t["name"], strong_index, keywords=keywords)
+            for code, _, _ in hits:
+                pool.add(str(code).zfill(6))
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  动态扩充强势股池失败：{e}（仅用 themes.json 静态池）")
+
+    return pool
 
 
 def _compute_streak(picks) -> dict[str, int]:
