@@ -1,12 +1,20 @@
-"""个股打分（十维 0-100）。
+"""个股打分（十二维 0-110 → 归一化 0-100）。
 
-权重盘 v2 (2026-06-15):
-  趋势 22 + 量能 18 + 动量 12 + 资金 10 + 安全 8 + 换手 5
-  + 涨停 10 + 估值 10 + 龙虎榜 5 + 财务 5  = 100
+v3 (2026-06-16):
+  趋势 18 + 量能 14 + 动量 10 + 资金 8 + 安全 6 + 换手 4
+  + 涨停 8 + 估值 8 + 龙虎榜 4 + 财务 4
+  + **技术信号 10** + **因子得分 6**  = 100
+
+新增技术信号（从 Iwencai「基础技术指标信号引擎」技能移植）：
+  ADX 趋势强度 + 方向 + 布林带位置 + RSI 位置 + OBV 量价配合 → 三维投票综合评分
+
+新增因子得分（从 Iwencai「多因子选股策略」技能移植）：
+  截面 Z-score 标准化后的动量/反转/波动率/量比因子等权综合得分 → 相对于候选池的相对排名
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -29,11 +37,14 @@ class Score:
     valuation: float
     longhu: float
     finance: float
+    technical: float        # 技术信号（ADX/BB/OBV 三维投票，0-10 归一化）
+    factor_score: float     # 多因子截面得分（相对排名，0-6 归一化）
     last_close: float
     suggested_stop_loss: float
+    fund_flow: Optional[dict] = field(default=None)
 
     def as_dict(self) -> dict:
-        return {
+        d = {
             "code": self.code,
             "name": self.name,
             "industry": self.industry,
@@ -48,9 +59,16 @@ class Score:
             "valuation": round(self.valuation, 1),
             "longhu": round(self.longhu, 1),
             "finance": round(self.finance, 1),
+            "technical_signal": round(self.technical, 1),
+            "factor_score": round(self.factor_score, 1),
             "last_close": round(self.last_close, 2),
             "suggested_stop_loss": round(self.suggested_stop_loss, 2),
         }
+        if self.fund_flow:
+            d["fund_flow_total"] = round(self.fund_flow.get("total_main_net", 0), 0)
+            d["fund_flow_trend"] = self.fund_flow.get("trend", "")
+            d["fund_flow_positive_days"] = self.fund_flow.get("positive_days", 0)
+        return d
 
 
 def _ma(s: pd.Series, n: int) -> float:
@@ -252,6 +270,132 @@ def score_longhu(lhb_net_buy: Optional[float] = None) -> float:
     return 0.0
 
 
+def score_technical(tech_signal: dict) -> float:
+    """技术信号评分（0-10 归一化到 0-10 权重）。
+
+    基于 ADX/布林带/RSI/OBV 三维投票综合信号。
+    参数来自 technical_signals.compute_technical_score() 的返回。
+    """
+    composite = tech_signal.get("composite_signal", 0)
+    # composite_signal 范围 0-10，直接映射
+    return min(composite, 10.0)
+
+
+def score_factor_zscore(zscore: Optional[float]) -> float:
+    """截面因子 Z-score 评分（0-6 归一化）。
+
+    zscore: 经过 Z-score 标准化后的综合因子得分。
+      - z > 1.5: 远超平均 → 6 分
+      - z > 1.0: 超过平均 1 个标准差 → 5 分
+      - z > 0.5: 略超平均 → 4 分
+      - -0.5 ≤ z ≤ 0.5: 中性 → 3 分
+      - z < -0.5: 偏弱 → 1 分
+      - z < -1.0: 显著偏弱 → 0 分
+      - None: 无法计算 → 3 分 (中性)
+    """
+    if zscore is None:
+        return 3.0
+    if zscore >= 1.5:
+        return 6.0
+    if zscore >= 1.0:
+        return 5.0
+    if zscore >= 0.5:
+        return 4.0
+    if zscore >= -0.5:
+        return 3.0
+    if zscore >= -1.0:
+        return 1.0
+    return 0.0
+
+
+def zscore_cross_section(values: dict[str, Optional[float]]) -> dict[str, float]:
+    """截面 Z-score 标准化（从「多因子选股策略」技能移植）。
+
+    对一组标的的某个因子值做截面标准化：
+      z = (x - mean) / std
+
+    Args:
+        values: {code: factor_value}
+
+    Returns:
+        {code: z_score}
+    """
+    valid = {k: v for k, v in values.items() if v is not None and not (isinstance(v, float) and math.isnan(v))}
+    if len(valid) < 3:
+        return {k: 0.0 for k in values}
+    vals = list(valid.values())
+    mean = sum(vals) / len(vals)
+    variance = sum((x - mean) ** 2 for x in vals) / (len(vals) - 1)
+    std = math.sqrt(variance) if variance > 1e-12 else 1.0
+    return {k: 0.0 if v is None else ((v - mean) / std) for k, v in values.items()}
+
+
+def compute_cross_sectional_factors(
+    kline_map: dict[str, pd.DataFrame],
+    candidate_codes: list[str],
+) -> dict[str, float]:
+    """候选池截面因子评分。
+
+    计算动量/波动率/量比三个因子，Z-score 标准化后等权合成。
+
+    Args:
+        kline_map: {code: kline_df}
+        candidate_codes: 候选代码列表
+
+    Returns:
+        {code: composite_zscore}
+    """
+    factor_data: dict[str, dict[str, Optional[float]]] = {c: {} for c in candidate_codes}
+
+    for code in candidate_codes:
+        kline = kline_map.get(code)
+        if kline is None or kline.empty or "收盘" not in kline.columns:
+            continue
+        close = kline["收盘"].astype(float)
+        if len(close) < 20:
+            continue
+
+        # 动量因子：过去 20 日累计收益
+        momentum = close.iloc[-1] / close.iloc[0] - 1 if len(close) >= 20 else 0
+        factor_data[code]["momentum"] = momentum * 100  # 转百分比
+
+        # 波动率因子（反向）：过去 20 日收益标准差（取负，值越大越好）
+        returns = close.pct_change().dropna()
+        if len(returns) >= 20:
+            vol = returns.tail(20).std() * 100
+            factor_data[code]["volatility"] = -vol  # 反向
+        else:
+            factor_data[code]["volatility"] = None
+
+        # 量比因子：近 5 日 / 前 20 日均量
+        if "成交量" in kline.columns:
+            volume = kline["成交量"].astype(float)
+            if len(volume) >= 25:
+                recent5 = volume.tail(5).mean()
+                prev20 = volume.iloc[-25:-5].mean()
+                factor_data[code]["volume_ratio"] = (recent5 / prev20) - 1 if prev20 > 0 else 0
+            else:
+                factor_data[code]["volume_ratio"] = None
+        else:
+            factor_data[code]["volume_ratio"] = None
+
+    # 每个因子做截面 Z-score
+    composite: dict[str, float] = {c: 0.0 for c in candidate_codes}
+    factor_count = 0
+    for factor_name in ("momentum", "volatility", "volume_ratio"):
+        raw = {c: factor_data[c].get(factor_name) for c in candidate_codes}
+        zs = zscore_cross_section(raw)
+        for c in candidate_codes:
+            composite[c] = composite.get(c, 0.0) + zs.get(c, 0.0)
+        factor_count += 1
+
+    # 等权平均 composite_zscore
+    if factor_count > 0:
+        for c in candidate_codes:
+            composite[c] = composite[c] / factor_count
+    return composite
+
+
 def score_finance(
     roe: Optional[float] = None,
     profit_growth: Optional[float] = None,
@@ -312,6 +456,8 @@ def score_one(
     lhb_net_buy: Optional[float] = None,
     roe: Optional[float] = None,
     profit_growth: Optional[float] = None,
+    tech_signal: Optional[dict] = None,          # 新增：技术信号得分
+    factor_zscore: Optional[float] = None,       # 新增：截面因子 Z-score
 ) -> Optional[Score]:
     if kline is None or kline.empty or "收盘" not in kline.columns:
         return None
@@ -320,16 +466,23 @@ def score_one(
     if len(closes) < 25:
         return None
 
-    t = score_trend(closes)
-    v = score_volume(volumes) if not volumes.empty else 0.0
-    m = score_momentum(closes)
-    f = score_fund(north_change, north_market_flow)
-    s = score_safety(closes)
-    to = score_turnover(turnover_rate)
-    lu = score_limit_up(zt_streak=zt_streak, limit_times_10d=limit_times_10d)
-    val = score_valuation(pe_ttm, pb)
-    lh = score_longhu(lhb_net_buy)
-    fin = score_finance(roe, profit_growth)
+    # 原始十维评分（权重总计 80，较 v2 压缩18%腾给新维度）
+    t = score_trend(closes) * (18 / 22)     # 22→18
+    v = score_volume(volumes) * (14 / 18) if not volumes.empty else 0.0      # 18→14
+    m = score_momentum(closes) * (10 / 12)  # 12→10
+    f = score_fund(north_change, north_market_flow) * (8 / 10)   # 10→8
+    s = score_safety(closes) * (6 / 8)      # 8→6
+    to = score_turnover(turnover_rate) * (4 / 5)  # 5→4
+    lu = score_limit_up(zt_streak=zt_streak, limit_times_10d=limit_times_10d) * (8 / 10)  # 10→8
+    val = score_valuation(pe_ttm, pb) * (8 / 10)  # 10→8
+    lh = score_longhu(lhb_net_buy) * (4 / 5)       # 5→4
+    fin = score_finance(roe, profit_growth) * (4 / 5)  # 5→4
+
+    # 新增：技术信号评分（权重 10）
+    tech = score_technical(tech_signal or {}) * (10 / 10)
+
+    # 新增：因子截面得分（权重 6）
+    fac = score_factor_zscore(factor_zscore) * (6 / 6)
 
     last = float(closes.iloc[-1])
     # 止损建议：MA20 与 -7% 取较高者
@@ -340,7 +493,7 @@ def score_one(
         code=code,
         name=name,
         industry=industry,
-        total=t + v + m + f + s + to + lu + val + lh + fin,
+        total=t + v + m + f + s + to + lu + val + lh + fin + tech + fac,
         trend=t,
         volume=v,
         momentum=m,
@@ -351,6 +504,8 @@ def score_one(
         valuation=val,
         longhu=lh,
         finance=fin,
+        technical=tech,
+        factor_score=fac,
         last_close=last,
         suggested_stop_loss=stop,
     )
