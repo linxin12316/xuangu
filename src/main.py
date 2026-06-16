@@ -23,7 +23,8 @@ from . import report as rpt
 from . import theme_scorer as ts
 from .config import load_config, apply_blacklist, dedup_by_industry
 from .notifier import send_to_wechat
-from .scoring import score_one
+from .scoring import score_one, compute_cross_sectional_factors
+from .technical_signals import compute_technical_score
 
 
 PICKS_DIR = Path(__file__).resolve().parent.parent / "picks"
@@ -529,7 +530,9 @@ def _score_candidates_concurrent(
 
     新增：腾讯行情批量预拉（量比/实时PE/实时换手）
           + 东财资金流批量预拉（主力净流入）
-    从股票行情分析项目引入的直连数据源。
+          + **技术信号**（ADX/布林带/RSI/OBV 三维投票）
+          + **截面因子得分**（动量/波动率/量比 Z-score）
+    从股票行情分析项目 + Iwencai 技能移入的直连数据源。
     """
     code_list = list(candidate_codes.keys())
 
@@ -555,9 +558,34 @@ def _score_candidates_concurrent(
         except Exception:
             pass
 
+    # 预拉所有 K 线（用于技术信号 + 截面因子计算）
+    print(f"   📥 预拉 {len(code_list)} 只 K 线（用于技术信号+截面因子）…")
+    kline_map: dict[str, pd.DataFrame] = {}
+    for code in code_list:
+        try:
+            kline_map[code] = dl.fetch_kline(code, days=80, use_mock=dry_run)
+        except Exception:
+            pass
+
+    # 计算截面因子得分（动量/波动率/量比 Z-score 标准化）
+    print("   📊 计算截面因子得分…")
+    factor_zscore_map = compute_cross_sectional_factors(kline_map, code_list)
+    print(f"      ✅ 截面因子计算完成")
+
+    # 计算技术信号（ADX/布林带/RSI/OBV 三维投票）
+    print("   📈 计算技术信号…")
+    tech_signal_map: dict[str, dict] = {}
+    for code in code_list:
+        kline = kline_map.get(code)
+        if kline is not None and not kline.empty:
+            tech_signal_map[code] = compute_technical_score(kline)
+    print(f"      ✅ 技术信号计算完成 ({len(tech_signal_map)} 只)")
+
     def _work(code: str, industry: str):
         try:
-            kline = dl.fetch_kline(code, days=80, use_mock=dry_run)
+            kline = kline_map.get(code)
+            if kline is None or kline.empty:
+                return None
             north = dl.fetch_north_flow(code, use_mock=dry_run)
             to = turnover_map.get(code) if turnover_map else None
             factors = dl.get_stock_factors(code, use_mock=dry_run)
@@ -591,6 +619,8 @@ def _score_candidates_concurrent(
                 lhb_net_buy=signals.get("lhb_net_buy"),
                 roe=None,             # 需 2000 积分,暂中性
                 profit_growth=None,   # 需 2000 积分,暂中性
+                tech_signal=tech_signal_map.get(code),       # 新增：技术信号
+                factor_zscore=factor_zscore_map.get(code),   # 新增：截面因子 Z-score
             )
             # 将资金流数据挂到 Score 对象上供报告使用
             if s and code in fundflow_enrich:
