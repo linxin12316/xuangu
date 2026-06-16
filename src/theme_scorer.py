@@ -40,7 +40,24 @@ def load_themes() -> list[dict]:
 
 
 def _calc_5d_chg(code: str) -> Optional[float]:
-    """单只股票近 5 日涨幅 %。失败返回 None。"""
+    """单只股票近 5 日涨幅 %。失败返回 None。
+
+    优先复用主流程的 market_window 缓存（Tushare 一次性全市场，0 额外开销）。
+    缓存未命中时单只 fetch_kline 兜底。
+    """
+    # 通道 1: 复用 main pipeline 已经拉过的全市场 5 日涨幅缓存
+    try:
+        window = dl.fetch_market_window(days=6, use_mock=False)
+        if window is not None and not window.empty:
+            row = window[window["code"] == str(code).zfill(6)]
+            if not row.empty:
+                v = row.iloc[0].get("chg_5d")
+                if pd.notna(v):
+                    return float(v)
+    except Exception:
+        pass
+
+    # 通道 2: 单只 K 线
     try:
         df = dl.fetch_kline(code, days=10)
         if df is None or len(df) < 6:
