@@ -58,8 +58,8 @@ def render_pick_report(
 
     lines.append("## 🎯 候选个股（按综合分排序）")
     lines.append("")
-    lines.append("| # | 代码 | 名称 | 板块 | 综合 | 趋势 | 量能 | 动量 | 资金 | 安全 | 换手 | 涨停 | 估值 | 龙虎 | 财务 | 现价 | 止损 | 标记 |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| # | 代码 | 名称 | 板块 | 综合 | 趋势 | 量能 | 动量 | 资金 | 安全 | 换手 | 涨停 | 估值 | 龙虎 | 财务 | 技术 | 因子 | 现价 | 止损 | 标记 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for i, s in enumerate(picks, 1):
         d = s.as_dict()
         streak = streak_map.get(s.code, 0)
@@ -69,11 +69,13 @@ def render_pick_report(
             f"**{d['total']}** | {d['trend']} | {d['volume']} | {d['momentum']} | "
             f"{d['fund']} | {d['safety']} | {d['turnover']} | {d['limit_up']} | "
             f"{d['valuation']} | {d['longhu']} | {d['finance']} | "
+            f"{d['technical_signal']} | {d['factor_score']} | "
             f"{d['last_close']} | {d['suggested_stop_loss']} | {tag} |"
         )
     lines.append("")
 
-    lines.append("*总分满分 100（趋势22+量能18+动量12+资金10+安全8+换手5+涨停10+估值10+龙虎5+财务5）*")
+    lines.append("*总分满分 100（趋势18+量能14+动量10+资金8+安全6+换手4+涨停8+估值8+龙虎4+财务4+技术信号10+因子得分6）*")
+    lines.append("**技术信号**=ADX趋势+布林带+RSI+OBV三维投票 | **因子得分**=截面Z-score相对排名")
     lines.append("*财务因子需 Tushare 2000 积分接口，当前免费版给中性 2.5 分*")
     lines.append("")
 
@@ -166,7 +168,7 @@ def render_pick_report(
     lines.append("- 综合分 70 以下的标的优先级降低")
     lines.append("- 同一板块最多同时持有 2 只，避免过度集中")
     lines.append("")
-    lines.append(f"*数据来源：Tushare（K线/北向/估值/资金流）+ akshare（同花顺资金流/涨停池/龙虎榜）*  \n*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
+    lines.append(f"*数据来源：腾讯财经(实时行情/量比) + 同花顺(热点/题材) + 东财(资金流/龙虎榜) + Tushare(K线/北向/估值) + akshare(涨停池) *  \n*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
 
     return "\n".join(lines)
 
@@ -361,7 +363,7 @@ def render_evening_report(
             buy_high = entry_price * 1.02
             lines.append(f"### #{i} {d['name']} ({d['code']}) · {d['industry']}{tag}")
             lines.append("")
-            lines.append(f"- **综合分**：**{d['total']}** （趋势{d['trend']} 量能{d['volume']} 动量{d['momentum']} 资金{d['fund']} 安全{d['safety']} 换手{d['turnover']} 涨停{d['limit_up']} 估值{d['valuation']} 龙虎{d['longhu']} 财务{d['finance']}）")
+            lines.append(f"- **综合分**：**{d['total']}** （趋势{d['trend']} 量能{d['volume']} 动量{d['momentum']} 资金{d['fund']} 安全{d['safety']} 换手{d['turnover']} 涨停{d['limit_up']} 估值{d['valuation']} 龙虎{d['longhu']} 财务{d['finance']} 技术{d['technical_signal']} 因子{d['factor_score']}）")
             lines.append(f"- **今日收盘**：{entry_price}")
             lines.append(f"- **明日买点**：≤{buy_high:.2f}（高开 ≤2%）→ 直接买；高开 2-5% → 等回踩 5 分钟均线再买；**高开 >5% 不追**")
             lines.append(f"- **止损位**：{stop}（约 {stop_pct:+.1f}%，跌破立即离场）")
@@ -375,7 +377,7 @@ def render_evening_report(
     lines.append("- 单只仓位不超过总资金 20%，跌破止损立刻走")
     lines.append("- 同板块最多持有 2 只，避免风险过度集中")
     lines.append("")
-    lines.append(f"*数据来源：Tushare（K线/北向/估值）+ akshare（同花顺资金流/涨停池/龙虎榜）*  ")
+    lines.append(f"*数据来源：腾讯财经(实时行情/量比) + 同花顺(热点/题材) + 东财(资金流/龙虎榜) + Tushare(K线/北向/估值) + akshare(涨停池) *  ")
     lines.append(f"*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
 
     return "\n".join(lines)
