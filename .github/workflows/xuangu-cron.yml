@@ -1,0 +1,142 @@
+name: Xuangu Cron
+
+# ============================================================
+# 合并 daily-pick / daily-review / evening-review / weekly-summary
+# 一个 workflow + 多个 cron + 内部派发 + fallback cron
+#
+# ⚠️ GitHub free plan 的 schedule 经常被丢（本仓库 24 次运行 0 次
+#    schedule 触发），所以每个任务设了 fallback cron。
+#    重复推送（如 review）比"完全没收到"代价低。
+#    pick 任务有去重：picks/<today>.json 已存在则跳过。
+# ============================================================
+
+on:
+  schedule:
+    # daily-pick: 北京 08:27 主 + 08:47 fallback (UTC 00:27 / 00:47)
+    - cron: '27 0 * * 1-5'
+    - cron: '47 0 * * 1-5'
+
+    # daily-review: 北京 16:07 主 + 16:27 fallback (UTC 08:07 / 08:27)
+    - cron: '7 8 * * 1-5'
+    - cron: '27 8 * * 1-5'
+
+    # evening-review: 北京 18:23 主 + 18:43 fallback (UTC 10:23 / 10:43)
+    - cron: '23 10 * * 1-5'
+    - cron: '43 10 * * 1-5'
+
+    # weekly-summary: 周日北京 17:47 (UTC 09:47)
+    - cron: '47 9 * * 0'
+
+  workflow_dispatch:
+    inputs:
+      task:
+        description: '手动指定跑哪个任务'
+        type: choice
+        required: true
+        default: 'pick'
+        options: ['pick', 'review', 'evening', 'weekly']
+      force:
+        description: '非交易日也强制运行（验证用）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      TZ: Asia/Shanghai
+    steps:
+      - name: Determine task
+        id: task
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "task=${{ inputs.task }}" >> $GITHUB_OUTPUT
+            echo "force=${{ inputs.force }}" >> $GITHUB_OUTPUT
+            echo "trigger=manual" >> $GITHUB_OUTPUT
+            echo "📌 手动触发：task=${{ inputs.task }} force=${{ inputs.force }}"
+            exit 0
+          fi
+
+          CRON='${{ github.event.schedule }}'
+          echo "🕒 schedule 触发，cron=${CRON}"
+
+          case "$CRON" in
+            "27 0 * * 1-5")  TASK=pick;     TRIG=primary  ;;
+            "47 0 * * 1-5")  TASK=pick;     TRIG=fallback ;;
+            "7 8 * * 1-5")   TASK=review;   TRIG=primary  ;;
+            "27 8 * * 1-5")  TASK=review;   TRIG=fallback ;;
+            "23 10 * * 1-5") TASK=evening;  TRIG=primary  ;;
+            "43 10 * * 1-5") TASK=evening;  TRIG=fallback ;;
+            "47 9 * * 0")    TASK=weekly;   TRIG=primary  ;;
+            *) echo "::error::未知 cron=$CRON"; exit 1 ;;
+          esac
+          echo "task=${TASK}" >> $GITHUB_OUTPUT
+          echo "force=false" >> $GITHUB_OUTPUT
+          echo "trigger=${TRIG}" >> $GITHUB_OUTPUT
+          echo "🎯 派发 task=${TASK} trigger=${TRIG}"
+
+      - uses: actions/checkout@v4
+
+      - name: Skip pick if already ran today
+        if: steps.task.outputs.task == 'pick' && steps.task.outputs.trigger == 'fallback'
+        id: dedup
+        run: |
+          TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+          if [ -f "picks/${TODAY}.json" ]; then
+            echo "::notice::picks/${TODAY}.json 已存在，主 cron 已成功，跳过 fallback"
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::picks/${TODAY}.json 不存在，主 cron 被丢，fallback 继续"
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Python
+        if: steps.dedup.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.dedup.outputs.skip != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run task
+        if: steps.dedup.outputs.skip != 'true'
+        env:
+          SCKEY: ${{ secrets.SCKEY }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          TASK: ${{ steps.task.outputs.task }}
+          FORCE: ${{ steps.task.outputs.force }}
+        run: |
+          set -e
+          echo "▶️ 运行 task=$TASK force=$FORCE trigger=${{ steps.task.outputs.trigger }}"
+
+          FORCE_FLAG=""
+          if [ "$FORCE" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+
+          case "$TASK" in
+            pick)    python -m src.main pick $FORCE_FLAG ;;
+            review)  python -m src.main review ;;
+            evening) python -m src.main evening $FORCE_FLAG ;;
+            weekly)  python -m src.backtest --days 14 ;;
+            *) echo "::error::未知 task=$TASK"; exit 1 ;;
+          esac
+
+      - name: Commit picks file
+        if: steps.task.outputs.task == 'pick' && steps.dedup.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add picks/
+          git diff --cached --quiet || git commit -m "chore: pick $(TZ=Asia/Shanghai date +%F)"
+          git push || true
