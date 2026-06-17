@@ -21,6 +21,7 @@ from . import data_loader as dl
 from . import filters as flt
 from . import report as rpt
 from . import theme_scorer as ts
+from . import zt_relay as ztr
 from .config import load_config, apply_blacklist, dedup_by_industry
 from .notifier import send_to_wechat
 from .scoring import score_one, compute_cross_sectional_factors
@@ -230,6 +231,21 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"   ⚠️  题材热度榜计算失败: {e}")
 
+    # 涨停接力候选（独立模块，失败不影响主推送）
+    try:
+        zt_picks, zt_warns = ztr.rank_zt_relay(
+            zt_pool=ctx["zt_pool"],
+            concept_ff=ctx["concept_ff"],
+            lhb_detail=ctx["lhb_detail"],
+            top_n=5,
+        )
+        zt_md = ztr.render_zt_relay_section(zt_picks, zt_warns, label="今日")
+        if zt_md:
+            md = md + "\n\n" + zt_md
+            print(f"   ✅ 涨停接力候选 {len(zt_picks)} 只 + 高位预警 {len(zt_warns)} 只")
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  涨停接力计算失败: {e}")
+
     if dry_run:
         print("\n" + "=" * 60)
         print(md)
@@ -325,6 +341,22 @@ def cmd_evening(dry_run: bool = False, force: bool = False) -> int:
             md = md + "\n\n" + theme_md
     except Exception as e:  # noqa: BLE001
         print(f"   ⚠️  题材热度榜计算失败: {e}")
+
+    # 涨停接力候选（独立模块，失败不影响主推送）
+    try:
+        zt_picks, zt_warns = ztr.rank_zt_relay(
+            zt_pool=ctx["zt_pool"],
+            concept_ff=ctx["concept_ff"],
+            lhb_detail=ctx["lhb_detail"],
+            top_n=5,
+        )
+        # evening 跑在盘后，今日涨停池预判明日接力
+        zt_md = ztr.render_zt_relay_section(zt_picks, zt_warns, label="明日")
+        if zt_md:
+            md = md + "\n\n" + zt_md
+            print(f"   ✅ 涨停接力候选 {len(zt_picks)} 只 + 高位预警 {len(zt_warns)} 只")
+    except Exception as e:  # noqa: BLE001
+        print(f"   ⚠️  涨停接力计算失败: {e}")
 
     if dry_run:
         print("\n" + "=" * 60)
