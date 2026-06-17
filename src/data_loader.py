@@ -904,6 +904,7 @@ def _reset_caches_for_test():
     global _INDUSTRY_FUNDFLOW_CACHE, _INDUSTRY_FUNDFLOW_TRIED
     global _ZT_POOL_CACHE, _ZT_POOL_TRIED
     global _LHB_DETAIL_CACHE, _LHB_DETAIL_TRIED
+    global _ZT_POOL_DATE, _LHB_DETAIL_DATE
     _HK_HOLD_CACHE = None
     _DAILY_BASIC_CACHE = None
     _LIMIT_LIST_CACHE = None
@@ -920,8 +921,10 @@ def _reset_caches_for_test():
     _INDUSTRY_FUNDFLOW_TRIED = False
     _ZT_POOL_CACHE = None
     _ZT_POOL_TRIED = False
+    _ZT_POOL_DATE = None
     _LHB_DETAIL_CACHE = None
     _LHB_DETAIL_TRIED = False
+    _LHB_DETAIL_DATE = None
 
 
 # ---------- 全市场行业映射（Tushare stock_basic, 不限速）----------
@@ -1069,8 +1072,26 @@ _INDUSTRY_FUNDFLOW_CACHE: Optional[pd.DataFrame] = None
 _INDUSTRY_FUNDFLOW_TRIED = False
 _ZT_POOL_CACHE: Optional[pd.DataFrame] = None
 _ZT_POOL_TRIED = False
+_ZT_POOL_DATE: Optional[str] = None  # 实际拉到的交易日 YYYYMMDD（修复跨夜推送日期错位）
 _LHB_DETAIL_CACHE: Optional[pd.DataFrame] = None
 _LHB_DETAIL_TRIED = False
+_LHB_DETAIL_DATE: Optional[str] = None
+
+
+def get_anchor_date() -> Optional[str]:
+    """返回当前 evening/review 实际锚定的交易日 (YYYY-MM-DD)。
+
+    优先用 涨停池 实际拉到的日期（最新一天的盘后数据），其次龙虎榜。
+    cron 延迟到次日凌晨触发时，datetime.now() 已跨日，但 zt_pool/lhb 接口
+    回退到的仍是上一交易日 → 用这个日期渲染标题与正文，避免日期与数据脱钩。
+    """
+    raw = _ZT_POOL_DATE or _LHB_DETAIL_DATE
+    if not raw:
+        return None
+    # YYYYMMDD → YYYY-MM-DD
+    if len(raw) == 8 and raw.isdigit():
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    return raw
 
 
 def fetch_concept_fundflow(use_mock: bool = False) -> Optional[pd.DataFrame]:
@@ -1142,7 +1163,7 @@ def fetch_zt_pool(use_mock: bool = False) -> Optional[pd.DataFrame]:
     返回字段含: 代码, 名称, 涨跌幅, 最新价, 成交额, 流通市值, 总市值, 换手率, 封板资金,
                首次封板时间, 最后封板时间, 炸板次数, 涨停统计, 连板数, 所属行业
     """
-    global _ZT_POOL_CACHE, _ZT_POOL_TRIED
+    global _ZT_POOL_CACHE, _ZT_POOL_TRIED, _ZT_POOL_DATE
     if _ZT_POOL_TRIED:
         return _ZT_POOL_CACHE
     _ZT_POOL_TRIED = True
@@ -1169,6 +1190,7 @@ def fetch_zt_pool(use_mock: bool = False) -> Optional[pd.DataFrame]:
                 df = None
             if df is not None and not df.empty:
                 _ZT_POOL_CACHE = df
+                _ZT_POOL_DATE = d
                 print(f"   ✅ 涨停池 {d} {len(df)} 只")
                 return _ZT_POOL_CACHE
         print("   ⚠️  涨停池近 6 天无数据")
@@ -1184,7 +1206,7 @@ def fetch_lhb_detail(use_mock: bool = False) -> Optional[pd.DataFrame]:
     返回字段含: 代码, 名称, 上榜日, 解读, 收盘价, 涨跌幅, 龙虎榜净买额, 龙虎榜买入额,
                龙虎榜卖出额, 净买额占总成交比, 上榜原因, 上榜后1日/2日/5日/10日
     """
-    global _LHB_DETAIL_CACHE, _LHB_DETAIL_TRIED
+    global _LHB_DETAIL_CACHE, _LHB_DETAIL_TRIED, _LHB_DETAIL_DATE
     if _LHB_DETAIL_TRIED:
         return _LHB_DETAIL_CACHE
     _LHB_DETAIL_TRIED = True
@@ -1211,6 +1233,7 @@ def fetch_lhb_detail(use_mock: bool = False) -> Optional[pd.DataFrame]:
                 df = None
             if df is not None and not df.empty:
                 _LHB_DETAIL_CACHE = df
+                _LHB_DETAIL_DATE = d
                 print(f"   ✅ 龙虎榜 {d} {len(df)} 行")
                 return _LHB_DETAIL_CACHE
         print("   ⚠️  龙虎榜近 5 天无数据")
