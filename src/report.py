@@ -248,10 +248,16 @@ def render_evening_report(
     risk_desc: str | None = None,
     north_flow: float | None = None,
     streak_map: dict[str, int] | None = None,
+    anchor_date: str | None = None,
 ) -> str:
-    """晚间深度复盘：今日盘面总结 + 明日 Top 3 候选（含买点/止损）。"""
+    """晚间深度复盘：今日盘面总结 + 明日 Top 3 候选（含买点/止损）。
+
+    anchor_date: 数据所属交易日 (YYYY-MM-DD)。cron 延迟到次日凌晨触发时，
+    此处传 zt_pool/lhb_detail 实际拉到的日期，避免标题写"今天"但内容是
+    "昨天"的脱钩。None 时回退到 datetime.now()（与原行为一致）。
+    """
     streak_map = streak_map or {}
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = anchor_date or datetime.now().strftime("%Y-%m-%d")
     lines = [f"# 🌙 晚间复盘 · {today}", "", DISCLAIMER, ""]
 
     # ---- 今日大盘 ----
