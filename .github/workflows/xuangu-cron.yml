@@ -146,25 +146,18 @@ jobs:
             review)  python -m src.main review ;;
             evening)
               python -m src.main evening $FORCE_FLAG
-              # 推送成功才落 flag（exit 非 0 上面 set -e 已退出）。
-              # 凌晨守卫返回 0 但实际未推送，这种场景"不写 flag"是正确的——
-              # 让后续 cron 还有机会跑（虽然守卫会再次拒绝，但至少没误标"已完成"）。
-              # main.py 内已用 dl.get_anchor_date() 做日期对齐，推送实际成功则 anchor 为今日。
-              TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)
-              # 仅在锚点日 == 今日时写 flag（守卫拒绝时 anchor 为空 → 跳过）
-              python -c "
-import sys
-sys.path.insert(0, '.')
-from src import data_loader as dl
-from datetime import datetime
-anchor = dl.get_anchor_date()
-today = datetime.now().strftime('%Y-%m-%d')
-sys.exit(0 if anchor == today else 1)
-" && {
+              # 推送成功才落 flag（set -e 保证 evening 命令失败已退出，下方不会执行）。
+              # 凌晨守卫返回 0 但未实际推送（此时 hour < 16），不落 flag。
+              # 守卫和这里都用北京时间（job 已设 TZ=Asia/Shanghai）。
+              HOUR=$(date +%H)
+              TODAY=$(date +%Y-%m-%d)
+              if [ "$HOUR" -ge 16 ]; then
                 mkdir -p picks
                 echo "evening pushed at $(date -Iseconds)" > "picks/${TODAY}-evening.flag"
                 echo "✅ 已落 picks/${TODAY}-evening.flag（后续 cron 将跳过）"
-              } || echo "ℹ️  未落 flag（凌晨守卫或锚点日不匹配，让后续 cron 继续）"
+              else
+                echo "ℹ️  hour=$HOUR < 16（凌晨守卫触发），未落 flag，让后续 cron 继续"
+              fi
               ;;
             weekly)  python -m src.backtest --days 14 ;;
             *) echo "::error::未知 task=$TASK"; exit 1 ;;
