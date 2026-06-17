@@ -258,8 +258,12 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
         if leaders_md:
             priority_blocks.append(leaders_md)
             print(f"   ✅ 今日热点领头 {len(leaders)} 只")
+        else:
+            print(f"   ℹ️  今日热点领头：0 命中（概念 × 强势股交集为空）")
     except Exception as e:  # noqa: BLE001
+        import traceback
         print(f"   ⚠️  今日热点领头计算失败: {e}")
+        traceback.print_exc()
 
     if priority_blocks:
         # render_pick_report 的主候选段是 "## 🎯 候选个股"
@@ -395,8 +399,12 @@ def cmd_evening(dry_run: bool = False, force: bool = False) -> int:
         if leaders_md:
             priority_blocks.append(leaders_md)
             print(f"   ✅ 今日热点领头 {len(leaders)} 只")
+        else:
+            print(f"   ℹ️  今日热点领头：0 命中（概念 × 强势股交集为空）")
     except Exception as e:  # noqa: BLE001
+        import traceback
         print(f"   ⚠️  今日热点领头计算失败: {e}")
+        traceback.print_exc()
 
     if priority_blocks:
         # render_evening_report 的「明日 Top N 候选」段是 "## 🎯 明日 Top"
