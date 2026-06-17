@@ -251,6 +251,7 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
     try:
         leaders = hl.rank_hot_leaders(
             concept_ff=ctx["concept_ff"],
+            industry_ff=ctx["industry_ff"],
             top_n=5,
             use_mock=dry_run,
         )
@@ -392,6 +393,7 @@ def cmd_evening(dry_run: bool = False, force: bool = False) -> int:
     try:
         leaders = hl.rank_hot_leaders(
             concept_ff=ctx["concept_ff"],
+            industry_ff=ctx["industry_ff"],
             top_n=5,
             use_mock=dry_run,
         )
