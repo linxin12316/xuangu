@@ -2,27 +2,30 @@ name: Xuangu Cron
 
 # ============================================================
 # 合并 daily-pick / daily-review / evening-review / weekly-summary
-# 一个 workflow + 多个 cron + 内部派发 + fallback cron
+# 一个 workflow + 多个 cron + 内部派发 + 三重错峰 cron
 #
-# ⚠️ GitHub free plan 的 schedule 经常被丢（本仓库 24 次运行 0 次
-#    schedule 触发），所以每个任务设了 fallback cron。
-#    重复推送（如 review）比"完全没收到"代价低。
-#    pick 任务有去重：picks/<today>.json 已存在则跳过。
+# ⚠️ GitHub free plan 的 schedule 经常整批丢失（已观测 6/17 全天 schedule 0 次触发），
+#    每个任务设三重错峰 cron + 去重，确保至少一次能跑成。
+#    pick / evening 有去重：完成标志（picks/<today>.json 或 picks/<today>-evening.flag）
+#    存在则跳过；review 重复推送代价低，不去重。
 # ============================================================
 
 on:
   schedule:
-    # daily-pick: 北京 08:27 主 + 08:47 fallback (UTC 00:27 / 00:47)
+    # daily-pick: 北京 08:27 / 08:47 / 09:13 三重 (UTC 00:27 / 00:47 / 01:13)
     - cron: '27 0 * * 1-5'
     - cron: '47 0 * * 1-5'
+    - cron: '13 1 * * 1-5'
 
-    # daily-review: 北京 16:07 主 + 16:27 fallback (UTC 08:07 / 08:27)
+    # daily-review: 北京 16:07 / 16:27 / 17:07 三重 (UTC 08:07 / 08:27 / 09:07)
     - cron: '7 8 * * 1-5'
     - cron: '27 8 * * 1-5'
+    - cron: '7 9 * * 1-5'
 
-    # evening-review: 北京 18:23 主 + 18:43 fallback (UTC 10:23 / 10:43)
+    # evening-review: 北京 18:23 / 18:43 / 19:13 三重 (UTC 10:23 / 10:43 / 11:13)
     - cron: '23 10 * * 1-5'
     - cron: '43 10 * * 1-5'
+    - cron: '13 11 * * 1-5'
 
     # weekly-summary: 周日北京 17:47 (UTC 09:47)
     - cron: '47 9 * * 0'
@@ -66,13 +69,16 @@ jobs:
           echo "🕒 schedule 触发，cron=${CRON}"
 
           case "$CRON" in
-            "27 0 * * 1-5")  TASK=pick;     TRIG=primary  ;;
-            "47 0 * * 1-5")  TASK=pick;     TRIG=fallback ;;
-            "7 8 * * 1-5")   TASK=review;   TRIG=primary  ;;
-            "27 8 * * 1-5")  TASK=review;   TRIG=fallback ;;
-            "23 10 * * 1-5") TASK=evening;  TRIG=primary  ;;
-            "43 10 * * 1-5") TASK=evening;  TRIG=fallback ;;
-            "47 9 * * 0")    TASK=weekly;   TRIG=primary  ;;
+            "27 0 * * 1-5")  TASK=pick;     TRIG=primary   ;;
+            "47 0 * * 1-5")  TASK=pick;     TRIG=fallback  ;;
+            "13 1 * * 1-5")  TASK=pick;     TRIG=tertiary  ;;
+            "7 8 * * 1-5")   TASK=review;   TRIG=primary   ;;
+            "27 8 * * 1-5")  TASK=review;   TRIG=fallback  ;;
+            "7 9 * * 1-5")   TASK=review;   TRIG=tertiary  ;;
+            "23 10 * * 1-5") TASK=evening;  TRIG=primary   ;;
+            "43 10 * * 1-5") TASK=evening;  TRIG=fallback  ;;
+            "13 11 * * 1-5") TASK=evening;  TRIG=tertiary  ;;
+            "47 9 * * 0")    TASK=weekly;   TRIG=primary   ;;
             *) echo "::error::未知 cron=$CRON"; exit 1 ;;
           esac
           echo "task=${TASK}" >> $GITHUB_OUTPUT
@@ -82,16 +88,27 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Skip pick if already ran today
-        if: steps.task.outputs.task == 'pick' && steps.task.outputs.trigger == 'fallback'
+      - name: Skip if already ran today
+        # pick: fallback/tertiary 时若 picks/<today>.json 已存在则跳过
+        # evening: fallback/tertiary 时若 picks/<today>-evening.flag 已存在则跳过
+        # review: 重复推送代价低，不去重（每条 cron 都跑）
+        if: |
+          (steps.task.outputs.task == 'pick' || steps.task.outputs.task == 'evening')
+          && (steps.task.outputs.trigger == 'fallback' || steps.task.outputs.trigger == 'tertiary')
         id: dedup
         run: |
           TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)
-          if [ -f "picks/${TODAY}.json" ]; then
-            echo "::notice::picks/${TODAY}.json 已存在，主 cron 已成功，跳过 fallback"
+          TASK="${{ steps.task.outputs.task }}"
+          if [ "$TASK" = "pick" ]; then
+            FLAG="picks/${TODAY}.json"
+          else
+            FLAG="picks/${TODAY}-evening.flag"
+          fi
+          if [ -f "$FLAG" ]; then
+            echo "::notice::$FLAG 已存在 → 任务已成功，跳过当前 ${{ steps.task.outputs.trigger }}"
             echo "skip=true" >> $GITHUB_OUTPUT
           else
-            echo "::notice::picks/${TODAY}.json 不存在，主 cron 被丢，fallback 继续"
+            echo "::notice::$FLAG 不存在 → 主 cron 被丢，${{ steps.task.outputs.trigger }} 继续"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
@@ -127,16 +144,40 @@ jobs:
           case "$TASK" in
             pick)    python -m src.main pick $FORCE_FLAG ;;
             review)  python -m src.main review ;;
-            evening) python -m src.main evening $FORCE_FLAG ;;
+            evening)
+              python -m src.main evening $FORCE_FLAG
+              # 推送成功才落 flag（exit 非 0 上面 set -e 已退出）。
+              # 凌晨守卫返回 0 但实际未推送，这种场景"不写 flag"是正确的——
+              # 让后续 cron 还有机会跑（虽然守卫会再次拒绝，但至少没误标"已完成"）。
+              # main.py 内已用 dl.get_anchor_date() 做日期对齐，推送实际成功则 anchor 为今日。
+              TODAY=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+              # 仅在锚点日 == 今日时写 flag（守卫拒绝时 anchor 为空 → 跳过）
+              python -c "
+import sys
+sys.path.insert(0, '.')
+from src import data_loader as dl
+from datetime import datetime
+anchor = dl.get_anchor_date()
+today = datetime.now().strftime('%Y-%m-%d')
+sys.exit(0 if anchor == today else 1)
+" && {
+                mkdir -p picks
+                echo "evening pushed at $(date -Iseconds)" > "picks/${TODAY}-evening.flag"
+                echo "✅ 已落 picks/${TODAY}-evening.flag（后续 cron 将跳过）"
+              } || echo "ℹ️  未落 flag（凌晨守卫或锚点日不匹配，让后续 cron 继续）"
+              ;;
             weekly)  python -m src.backtest --days 14 ;;
             *) echo "::error::未知 task=$TASK"; exit 1 ;;
           esac
 
       - name: Commit picks file
-        if: steps.task.outputs.task == 'pick' && steps.dedup.outputs.skip != 'true'
+        # pick / evening 都要提交 picks/ 下的文件（pick 写 .json，evening 写 .flag）
+        if: |
+          (steps.task.outputs.task == 'pick' || steps.task.outputs.task == 'evening')
+          && steps.dedup.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add picks/
-          git diff --cached --quiet || git commit -m "chore: pick $(TZ=Asia/Shanghai date +%F)"
+          git diff --cached --quiet || git commit -m "chore: ${{ steps.task.outputs.task }} $(TZ=Asia/Shanghai date +%F)"
           git push || true
