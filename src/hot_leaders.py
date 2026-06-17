@@ -1,17 +1,22 @@
 """今日热点领头股 (Today's Hot Leaders)。
 
-针对你抱怨的「Top 3 候选和今天最热板块不搭」的问题，独立挑「今日资金最热的概念里、当日表现最强的票」——和主十维候选（基本面+趋势）/ zt_relay（涨停接力）正交。
+针对你抱怨的「Top 3 候选和今天最热板块不搭」的问题，独立挑「今日资金最热的板块里、当日表现最强的票」——和主十维候选（基本面+趋势）/ zt_relay（涨停接力）正交。
 
-数据来源：
-  - dl.fetch_concept_fundflow()：今日同花顺概念资金净流入榜（385 个概念）
-  - dl.fetch_hot_stocks_candidates() / get_hot_stocks()：同花顺当日强势股 + 题材归因
-  - 取概念榜 Top 15 的概念名 → 在强势股的 reason 字段里精确匹配 → 涨幅×资金 综合排序
+数据来源（盘后稳定可用）：
+  - dl.fetch_industry_fundflow()：今日同花顺行业资金净流入榜（90 个一级行业，主板覆盖好）
+  - dl.fetch_concept_fundflow()：今日同花顺概念资金净流入榜（385 个，含创业板/科创板次新）
+  - dl.fetch_spot()：腾讯/新浪全市场快照，按名称查代码
+  - 双源融合：行业榜 + 概念榜的领涨股 ∪ 取并集，主板优先
+
+为什么这样设计？
+  - 已踩坑：同花顺强势股接口在非交易时段 change_pct 字段全为 0%（见 [[news-radar]] 笔记）
+  - 已踩坑：概念榜 Top N 领涨股大量集中在创业板/科创板（10/16 +20% 等次新票）
+  - 行业榜（申万一级）天然偏主板，与概念榜互补，融合后能保证主板候选不被抹掉
 
 筛选：
-  - 涨幅 ≥ 5%（"今日热点"硬门槛）
-  - 命中"今日资金净流入 Top 15 概念名"中至少一个
+  - 概念榜 + 行业榜各取 Top N → 取领涨股
   - 排除 ST/创/科/北
-  - 流通市值 30-1500 亿
+  - 涨幅 ≥ 3%
 """
 from __future__ import annotations
 from typing import Optional
@@ -23,17 +28,9 @@ from . import data_loader as dl
 
 # ---------- 配置 ----------
 
-# 涨幅下限：3.5% 是"今日有实质上涨"的合理底线
-# 同花顺强势股榜评的是综合动量，不保证当日 ≥5%；门槛设太严会出现"96 只强势股 0 个入选"的情况
-MIN_CHANGE_PCT = 3.5
-TOP_CONCEPT_N = 15             # 取多少个热门概念名做匹配
-MIN_MCAP_YI = 30.0             # 流通市值下限（亿）
-MAX_MCAP_YI = 1500.0           # 流通市值上限（亿）
-
-# 保底模式：即使没有股票过 MIN_CHANGE_PCT 门槛，也展示前 N 只「最贴热点」的强势股
-# 让用户在大盘平淡日仍能看到"今天最接近今日热点的票"
-FALLBACK_MIN_CHANGE_PCT = 1.0
-
+MIN_CHANGE_PCT = 3.0           # 领涨股涨幅下限
+TOP_INDUSTRY_N = 15            # 行业榜扫描深度（90 个一级行业，前 15 已经够覆盖主板热点）
+TOP_CONCEPT_N = 50             # 概念榜扫描深度（创业板/科创板多，需扩大才能筛出主板）
 EXCLUDE_PREFIXES = ("300", "301", "688", "689", "8", "4", "92")
 
 
@@ -41,92 +38,122 @@ EXCLUDE_PREFIXES = ("300", "301", "688", "689", "8", "4", "92")
 
 def rank_hot_leaders(
     concept_ff: Optional[pd.DataFrame],
-    hot_stocks: Optional[dict] = None,
+    industry_ff: Optional[pd.DataFrame] = None,
+    hot_stocks: Optional[dict] = None,  # 兼容参数，未使用
+    spot_df: Optional[pd.DataFrame] = None,
     top_n: int = 5,
     use_mock: bool = False,
 ) -> list[dict]:
-    """挑今日热点领头股。
+    """挑今日热点领头股 —— 行业榜 + 概念榜领涨股双源融合。
 
-    Returns: list of {code, name, change_pct, turnover, amount_yi, reason, hot_concepts, score}
+    Returns: list of {code, name, change_pct, source, sector, net_flow_yi, score}
     """
-    # 1) 提取热门概念名集合
-    hot_concepts: list[str] = []
-    if concept_ff is not None and not concept_ff.empty:
-        col = "行业" if "行业" in concept_ff.columns else concept_ff.columns[0]
-        # 去掉太宽泛的概念名（"AI"等单字会误匹配）
-        for c in concept_ff.head(TOP_CONCEPT_N)[col].astype(str).tolist():
-            if len(c) >= 2:
-                hot_concepts.append(c)
+    if use_mock:
+        return _mock_leaders()
 
-    if not hot_concepts:
-        print("   ℹ️  hot_leaders: 无热门概念名，跳过")
+    if (concept_ff is None or concept_ff.empty) and (industry_ff is None or industry_ff.empty):
+        print("   ℹ️  hot_leaders: concept_ff 和 industry_ff 都为空")
         return []
-    print(f"   📊 hot_leaders: 热门概念 Top {len(hot_concepts)}: {hot_concepts[:6]}…")
 
-    # 2) 拿同花顺强势股
-    if hot_stocks is None:
-        hot_stocks = dl.fetch_hot_stocks_candidates() if not use_mock else _mock_hot_stocks()
-    if not hot_stocks:
-        print("   ℹ️  hot_leaders: 强势股池空")
-        return []
-    print(f"   📊 hot_leaders: 强势股池 {len(hot_stocks)} 只")
+    # 拉全市场快照用于「领涨股名称 → 代码」反查
+    if spot_df is None:
+        try:
+            spot_df = dl.fetch_spot()
+        except Exception as e:
+            print(f"   ⚠️  hot_leaders: fetch_spot 失败 {e}")
+            spot_df = None
 
-    # 3) 过滤 + 命中匹配（两轮：严格门槛 → 不够 5 只时启用保底门槛）
-    def _scan(min_chg: float) -> tuple[list[dict], dict]:
-        out: list[dict] = []
-        stat = {"blacklist": 0, "lowchg": 0, "nomatch": 0}
-        for code, info in hot_stocks.items():
-            code6 = str(code).zfill(6)
-            if code6.startswith(EXCLUDE_PREFIXES):
+    name_to_code: dict[str, str] = {}
+    if spot_df is not None and not spot_df.empty:
+        name_col = "名称" if "名称" in spot_df.columns else spot_df.columns[1]
+        code_col = "代码" if "代码" in spot_df.columns else spot_df.columns[0]
+        for _, r in spot_df.iterrows():
+            name_to_code[str(r[name_col])] = str(r[code_col]).zfill(6)
+
+    candidates: list[dict] = []
+    seen_codes: set[str] = set()
+    stat = {"blacklist": 0, "lowchg": 0, "no_code": 0, "dup_merge": 0}
+
+    def _scan(df: pd.DataFrame, top: int, source: str) -> None:
+        for _, r in df.head(top).iterrows():
+            try:
+                sector = str(r.get("行业") or r.get("概念") or "")
+                leader_name = str(r.get("领涨股") or "").strip()
+                leader_chg = float(r.get("领涨股-涨跌幅", 0) or 0)
+                net_flow = float(r.get("净额", 0) or 0)
+            except (ValueError, TypeError):
+                continue
+            if not leader_name or leader_name == "-":
+                continue
+            code = name_to_code.get(leader_name)
+            if not code:
+                stat["no_code"] += 1
+                continue
+
+            # 黑名单
+            if code.startswith(EXCLUDE_PREFIXES):
                 stat["blacklist"] += 1
                 continue
-            name = info.get("name", "")
-            if "ST" in name or "退" in name or name.startswith("N"):
+            if "ST" in leader_name or "退" in leader_name or leader_name.startswith("N"):
                 stat["blacklist"] += 1
                 continue
-            change_pct = float(info.get("change_pct", 0) or 0)
-            if change_pct < min_chg:
+
+            if leader_chg < MIN_CHANGE_PCT:
                 stat["lowchg"] += 1
                 continue
-            reason = str(info.get("reason", ""))
-            matched = [c for c in hot_concepts if c in reason]
-            if not matched:
-                stat["nomatch"] += 1
+
+            # 重复时合并到原条目
+            if code in seen_codes:
+                stat["dup_merge"] += 1
+                for c in candidates:
+                    if c["code"] == code:
+                        merged = c.setdefault("sector_list", [c["sector"]])
+                        if sector not in merged:
+                            merged.append(sector)
+                            c["sector"] = " / ".join(merged[:3])
+                        break
                 continue
+            seen_codes.add(code)
 
-            # 综合分：涨幅(0-50) + 命中数(0-30) + DDE资金(0-20)
-            score_chg = min((change_pct - min_chg) / 10 * 25 + 25, 50)
-            score_match = min(len(matched) * 10, 30)
-            dde = float(info.get("dde_net", 0) or 0)
-            score_dde = 20 if dde >= 1e8 else (10 if dde > 0 else 0)
-            total = round(score_chg + score_match + score_dde, 1)
-            out.append({
-                "code": code6,
-                "name": name,
-                "change_pct": change_pct,
-                "turnover": float(info.get("turnover_pct", 0) or 0),
-                "dde_net_yi": dde / 1e8,
-                "reason": reason[:50],
-                "hot_concepts": matched,
+            score_chg = min((leader_chg - MIN_CHANGE_PCT) / 7 * 25 + 25, 50)
+            if net_flow >= 20:
+                score_flow = 30
+            elif net_flow >= 10:
+                score_flow = 22
+            elif net_flow >= 5:
+                score_flow = 15
+            elif net_flow > 0:
+                score_flow = 8
+            else:
+                score_flow = 0
+            rank = len(candidates) + 1
+            score_rank = max(20 - rank * 1.0, 0)
+            total = round(score_chg + score_flow + score_rank, 1)
+
+            candidates.append({
+                "code": code,
+                "name": leader_name,
+                "change_pct": leader_chg,
+                "source": source,
+                "sector": sector,
+                "sector_list": [sector],
+                "net_flow_yi": net_flow,
                 "score": total,
-                "fallback": min_chg < MIN_CHANGE_PCT,
+                "fallback": False,
             })
-        return out, stat
 
-    candidates, stat = _scan(MIN_CHANGE_PCT)
-    print(f"   📊 hot_leaders[严格 {MIN_CHANGE_PCT}%]: 黑名单 {stat['blacklist']} / 涨幅<门槛 {stat['lowchg']} / 概念未命中 {stat['nomatch']} → 入选 {len(candidates)}")
+    # 1) 行业榜（主板覆盖好，优先扫）
+    if industry_ff is not None and not industry_ff.empty:
+        _scan(industry_ff, TOP_INDUSTRY_N, "行业")
+    # 2) 概念榜（补充科技/题材热点）
+    if concept_ff is not None and not concept_ff.empty:
+        _scan(concept_ff, TOP_CONCEPT_N, "概念")
 
-    if len(candidates) < 3:
-        # 保底：降低涨幅门槛，让"贴近热点但今日涨幅平的票"也能浮出
-        fb_candidates, fb_stat = _scan(FALLBACK_MIN_CHANGE_PCT)
-        print(f"   📊 hot_leaders[保底 {FALLBACK_MIN_CHANGE_PCT}%]: 入选 {len(fb_candidates)}（差额 {len(fb_candidates) - len(candidates)} 只来自保底）")
-        # 严格的优先排前面
-        existing = {c["code"] for c in candidates}
-        for fb in fb_candidates:
-            if fb["code"] not in existing:
-                candidates.append(fb)
+    print(f"   📊 hot_leaders: 行业 Top {TOP_INDUSTRY_N} + 概念 Top {TOP_CONCEPT_N} → "
+          f"黑名单 {stat['blacklist']} / 涨幅<{MIN_CHANGE_PCT}% {stat['lowchg']} / "
+          f"名称无映射 {stat['no_code']} / 重复合并 {stat['dup_merge']} → 入选 {len(candidates)}")
 
-    candidates.sort(key=lambda x: (not x.get("fallback", False), x["score"], x["change_pct"]), reverse=True)
+    candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:top_n]
 
 
@@ -139,31 +166,22 @@ def render_hot_leaders_section(
         return ""
 
     lines: list[str] = ["", "---", f"## 🔥 {label}热点领头股"]
-    lines.append(f"> 从「{label}资金净流入 Top {TOP_CONCEPT_N} 概念」的强势股中筛选——")
-    lines.append("> 涨幅×题材命中×DDE资金 综合打分，专补主十维偏长线、错过情绪热点的盲区。")
-
-    has_fallback = any(c.get("fallback") for c in leaders)
-    if has_fallback:
-        lines.append(f"> ⚠️ 大盘平淡，部分票涨幅 < {MIN_CHANGE_PCT}% 来自保底匹配（标 ⚪）。")
+    lines.append(f"> 行业榜 + 概念榜的领涨股（双源融合，主板优先）。")
+    lines.append("> 综合分 = 领涨涨幅 + 板块资金净流入 + 板块热度排名。")
     lines.append("")
-    lines.append("| # | 代码 | 名称 | 涨幅 | 换手 | DDE资金 | 命中概念 | 综合 |")
-    lines.append("|---|---|---|---:|---:|---:|---|---:|")
+    lines.append("| # | 代码 | 名称 | 涨幅 | 来源 | 板块 | 净流入 | 综合 |")
+    lines.append("|---|---|---|---:|---|---|---:|---:|")
     for i, c in enumerate(leaders, 1):
-        if c.get("fallback"):
-            tag = " ⚪"
-        elif c["score"] >= 80:
+        if c["score"] >= 80:
             tag = " 🔥"
         elif c["score"] >= 65:
             tag = " ⭐"
         else:
             tag = ""
-        concepts = "+".join(c["hot_concepts"][:2])
-        if len(c["hot_concepts"]) > 2:
-            concepts += f" 等{len(c['hot_concepts'])}"
         lines.append(
             f"| {i} | `{c['code']}` | **{c['name']}**{tag} | "
-            f"+{c['change_pct']:.1f}% | {c['turnover']:.1f}% | "
-            f"{c['dde_net_yi']:+.1f}亿 | {concepts} | **{c['score']}** |"
+            f"+{c['change_pct']:.1f}% | {c.get('source','—')} | {c['sector']} | "
+            f"{c['net_flow_yi']:+.1f}亿 | **{c['score']}** |"
         )
     lines.append("")
     lines.append(f"> ⚠️ 此栏为「**情绪/资金驱动**」候选，与十维主候选「**基本面+趋势**」并行。")
@@ -171,11 +189,13 @@ def render_hot_leaders_section(
     return "\n".join(lines)
 
 
-def _mock_hot_stocks() -> dict:
+def _mock_leaders() -> list[dict]:
     """dry-run 用 mock。"""
-    return {
-        "600183": {"name": "生益科技", "reason": "PCB概念+CCL", "change_pct": 8.5, "turnover_pct": 6.5, "dde_net": 5e8},
-        "601127": {"name": "赛力斯", "reason": "华为概念+智能驾驶", "change_pct": 6.2, "turnover_pct": 4.5, "dde_net": 3e8},
-        "601136": {"name": "首创证券", "reason": "证券", "change_pct": 7.0, "turnover_pct": 8.0, "dde_net": 2e8},
-        "002240": {"name": "盛新锂能", "reason": "稀土+新能源", "change_pct": 5.5, "turnover_pct": 5.0, "dde_net": 1.5e8},
-    }
+    return [
+        {"code": "600183", "name": "生益科技", "change_pct": 8.5, "source": "行业",
+         "sector": "电子", "sector_list": ["电子"], "net_flow_yi": 25.6, "score": 85.0, "fallback": False},
+        {"code": "601127", "name": "赛力斯", "change_pct": 6.2, "source": "概念",
+         "sector": "华为概念", "sector_list": ["华为概念"], "net_flow_yi": 18.3, "score": 72.5, "fallback": False},
+        {"code": "601012", "name": "隆基绿能", "change_pct": 5.0, "source": "行业",
+         "sector": "光伏设备", "sector_list": ["光伏设备"], "net_flow_yi": 8.2, "score": 60.0, "fallback": False},
+    ]
