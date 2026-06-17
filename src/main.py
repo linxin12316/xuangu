@@ -268,6 +268,26 @@ def cmd_evening(dry_run: bool = False, force: bool = False) -> int:
         print("⏸️  今日非交易日，跳过晚间复盘")
         return 0
 
+    # 凌晨触发守卫：GitHub schedule 经常拖到次日凌晨才执行（已观测 6/16 18:43
+    # 主 cron 拖到 6/17 05:35），此时 datetime.now() 已跨日，再发"今日复盘"
+    # 会出现标题日期与盘后数据(zt_pool/lhb 自动回退到上一交易日)脱钩。
+    # 北京时间 < 16:00 视为延迟触发：直接跳过 + 发警告，--force 可越过。
+    if not dry_run and not force:
+        now_h = datetime.now().hour
+        if now_h < 16:
+            warn_title = "⚠️ 晚间复盘延迟触发，已跳过"
+            warn_body = (
+                f"# 晚间复盘任务在 {datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                f"被触发\n\n"
+                "这是 GitHub Actions schedule 跨日延迟的兜底拒绝：当前已是次日凌晨，"
+                "原本属于上一交易日的盘后数据若按 datetime.now() 渲染会写成"
+                "次日日期，造成日期与数据脱钩。\n\n"
+                "**未发送复盘报告**。如需补发，请手动 dispatch 时勾选 force。"
+            )
+            print(f"⏸️  {warn_title}")
+            send_to_wechat(warn_title, warn_body)
+            return 0
+
     ctx = _run_full_pipeline(dry_run=dry_run, top_n=3, override_max_picks=True)
     picks = ctx["picks"]
 
@@ -294,6 +314,7 @@ def cmd_evening(dry_run: bool = False, force: bool = False) -> int:
         risk_desc=ctx["risk_desc"],
         north_flow=ctx["north_market_flow"],
         streak_map=ctx["streak_map"],
+        anchor_date=dl.get_anchor_date(),
     )
 
     # 题材热度榜（独立模块，失败不影响主推送）
@@ -311,7 +332,7 @@ def cmd_evening(dry_run: bool = False, force: bool = False) -> int:
         print("=" * 60)
         return 0
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = dl.get_anchor_date() or datetime.now().strftime("%Y-%m-%d")
     title = f"🌙 晚间复盘 {today}"
     ok = send_to_wechat(title, md)
     return 0 if ok else 1
