@@ -53,34 +53,43 @@ def rank_hot_leaders(
                 hot_concepts.append(c)
 
     if not hot_concepts:
+        print("   ℹ️  hot_leaders: 无热门概念名，跳过")
         return []
+    print(f"   📊 hot_leaders: 热门概念 Top {len(hot_concepts)}: {hot_concepts[:6]}…")
 
     # 2) 拿同花顺强势股
     if hot_stocks is None:
         hot_stocks = dl.fetch_hot_stocks_candidates() if not use_mock else _mock_hot_stocks()
     if not hot_stocks:
+        print("   ℹ️  hot_leaders: 强势股池空")
         return []
+    print(f"   📊 hot_leaders: 强势股池 {len(hot_stocks)} 只")
 
     # 3) 过滤 + 命中匹配
     candidates: list[dict] = []
+    n_blacklist = n_lowchg = n_nomatch = 0
     for code, info in hot_stocks.items():
         code6 = str(code).zfill(6)
 
         # 黑名单（同 [[xuangu-stock-blacklist]]）
         if code6.startswith(EXCLUDE_PREFIXES):
+            n_blacklist += 1
             continue
         name = info.get("name", "")
         if "ST" in name or "退" in name or name.startswith("N"):
+            n_blacklist += 1
             continue
 
         change_pct = float(info.get("change_pct", 0) or 0)
         if change_pct < MIN_CHANGE_PCT:
+            n_lowchg += 1
             continue
 
         reason = str(info.get("reason", ""))
         # reason 里命中了哪些热门概念
         matched = [c for c in hot_concepts if c in reason]
         if not matched:
+            n_nomatch += 1
             continue
 
         # 综合分：涨幅(0-50) + 命中数(0-30) + DDE资金(0-20)
@@ -101,6 +110,8 @@ def rank_hot_leaders(
             "hot_concepts": matched,
             "score": total,
         })
+
+    print(f"   📊 hot_leaders: 黑名单 {n_blacklist} / 涨幅<{MIN_CHANGE_PCT}% {n_lowchg} / 概念未命中 {n_nomatch} → 入选 {len(candidates)}")
 
     candidates.sort(key=lambda x: (x["score"], x["change_pct"]), reverse=True)
     return candidates[:top_n]
