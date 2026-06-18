@@ -198,6 +198,10 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
         print("⏸️  今日非交易日，跳过推送")
         return 0
 
+    if not dry_run and not force and datetime.now().hour >= 9:
+        print(f"⏰ 已超过 09:00 ({datetime.now().strftime('%H:%M')}），跳过早盘推送")
+        return 0
+
     ctx = _run_full_pipeline(dry_run=dry_run, top_n=top_n)
     picks = ctx["picks"]
     risk_score = ctx["risk_score"]
@@ -295,6 +299,13 @@ def cmd_pick(dry_run: bool = False, top_n: int = 5, force: bool = False) -> int:
 
     title = f"📈 选股报告 {today}"
     ok = send_to_wechat(title, md)
+    if ok:
+        pushed_flag = PICKS_DIR / f"{today}-pushed.flag"
+        pushed_flag.write_text(
+            f"pick pushed at {datetime.now().isoformat()}\n",
+            encoding="utf-8",
+        )
+        print(f"✅ 已落 {pushed_flag}（后续 cron / 本地兜底将跳过）")
     return 0 if ok else 1
 
 
