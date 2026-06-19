@@ -16,7 +16,7 @@ A 股每日选股工具：每个交易日 9 点前多重调度 + 本地兜底推
 | 时间（北京）| 任务 | 输出 |
 |---|---|---|
 | 07:55 / 08:10 / 08:25 / 08:40 | 盘前选股（GitHub 四重） | 候选股 Top 5（十维评分、止损建议、所属行业、连续上榜标记） |
-| 08:35 / 08:50 | 盘前选股（本地 Mac 兜底，可选） | 若 GitHub 未成功推送，则本机接管发送 |
+| 08:35 / 08:50 | 盘前选股（本地 Mac/Windows 兜底，可选） | 若 GitHub 未成功推送，则本机接管发送 |
 | 16:05 | 盘后复盘 | 大盘总结 + 候选股当日表现 + 命中率 |
 | 周日 17:47 | 周度回测 | 近 14 天命中率、跑赢沪深300、最佳/最差候选 |
 
@@ -170,6 +170,76 @@ logs/pick-fallback.err.log
 ```
 
 兜底脚本会先 `git pull`，再检查 `picks/<日期>-pushed.flag`。如果 GitHub 已成功推送，本地不会重复发；如果本地先推送成功，会提交该 flag（或在配置 `GITHUB_TOKEN` 时用 GitHub API 上传），尽量阻止 GitHub 延迟任务重复发送。
+
+---
+
+## 本地 Windows 兜底（确保 9 点前）
+
+和 Mac 版一样，在 Windows 上也可以注册任务计划程序，工作日 08:35 / 08:50 自动检查 GitHub 是否已成功推送，未推送则由本机接管。
+
+### 前置条件
+
+- Python 3.10+（推荐从 [python.org](https://www.python.org/downloads/) 下载安装，安装时勾选 **Add Python to PATH**）
+- Git（可选，从 [git-scm.com](https://git-scm.com/) 下载）
+
+### 安装步骤
+
+```powershell
+cd C:\path\to\xuangu
+
+# 1. 复制环境变量模板并填入真实密钥
+Copy-Item .env.example .env
+# 编辑 .env（记事本或 VS Code），填入 SCKEY 和 TUSHARE_TOKEN
+
+# 2. 安装 Python 依赖
+pip install -r requirements.txt
+
+# 3. 以管理员身份运行安装脚本
+powershell -ExecutionPolicy Bypass -File windows\setup_windows.ps1
+```
+
+> 安装脚本会自动：
+> - 检查 Python 3 是否安装
+> - 检查 `.env` 中是否填了 SCKEY
+> - 安装 pip 依赖（如果缺失）
+> - 注册 Windows 任务计划程序（工作日 08:35 / 08:50 各触发一次）
+> - 提供 dry-run 测试选项
+
+### 手动测试兜底脚本
+
+```powershell
+# dry-run 模式（离线 mock 数据，不推送）
+.\scripts\run_pick_fallback.ps1 -DryRun
+
+# 真实运行
+.\scripts\run_pick_fallback.ps1
+```
+
+### 检查日志
+
+```powershell
+# 兜底运行日志
+Get-Content .\logs\local-fallback.log -Tail 20
+
+# 任务计划程序历史：打开「事件查看器」→ 应用程序和服务日志 → Microsoft → Windows → TaskScheduler → Operational
+```
+
+### 卸载
+
+```powershell
+powershell -ExecutionPolicy Bypass -File windows\setup_windows.ps1 -Uninstall
+```
+
+或者手动打开「任务计划程序」删除 `XuanguStockPick` 任务。
+
+### 工作原理
+
+和 Mac 版完全一致：
+1. 任务计划程序在 08:35 / 08:50 触发 `run_pick_fallback.ps1`
+2. 脚本检查 `picks/<今日日期>-pushed.flag` 是否存在（由主流程推送成功后创建）
+3. 如果 flag 存在 → GitHub 已经推过了，本地跳过
+4. 如果 flag 不存在 → 本机执行选股 + 微信推送
+5. 推送成功后创建 flag + 上传到 GitHub（需配置 `GITHUB_TOKEN`），防止后续 GitHub Actions 延迟实例重复推送
 
 ---
 
