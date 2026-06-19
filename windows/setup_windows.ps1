@@ -1,6 +1,14 @@
 # setup_windows.ps1
-# Windows 本地兜底 — 一键配置脚本
-# 以管理员身份运行，否则任务计划程序创建失败
+# Windows 本地兜底 — 旧版（推荐改用 setup_daemon.ps1 获取实时推送）
+#
+# 新版 daemon 模式（推荐）：
+#   powershell -ExecutionPolicy Bypass -File windows\setup_daemon.ps1
+#   - 连续运行，盘中每 2 分钟推送实时快讯
+#   - 自动盘前选股 + 晚间复盘
+#   - 登录/开机自动启动
+#
+# 旧版兜底模式（这份脚本）：
+#   仅工作日 08:35/08:50 触发一次检查，无实时推送
 #
 # 用法：
 #   # 1. 先填好 .env
@@ -17,6 +25,23 @@ param(
     [switch]$Uninstall,
     [switch]$DryRun
 )
+
+# ========== 推荐使用新版 daemon ==========
+Write-Host "╔══════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║  推荐使用新版 Daemon 模式（实时盘中推送）║" -ForegroundColor Cyan
+Write-Host "║  windows\setup_daemon.ps1              ║" -ForegroundColor Cyan
+Write-Host "║                                          ║" -ForegroundColor Cyan
+Write-Host "║  ✓ 交易时段每 2 分钟推送实时快讯        ║" -ForegroundColor Cyan
+Write-Host "║  ✓ 自动盘前选股 + 晚间复盘               ║" -ForegroundColor Cyan
+Write-Host "║  ✓ 登录/开机自动启动                     ║" -ForegroundColor Cyan
+Write-Host "╚══════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host ""
+$useOld = Read-Host "是否继续使用旧版兜底（仅 08:35/08:50 检查）？[y/N]"
+if ($useOld -ne "y" -and $useOld -ne "Y") {
+    Write-Host "正在转到新版 daemon 安装脚本..." -ForegroundColor Cyan
+    & powershell -ExecutionPolicy Bypass -File "$PSScriptRoot\setup_daemon.ps1" @($MyInvocation.BoundParameters.GetEnumerator() | ForEach-Object { "-$($_.Key)", "$($_.Value)" })
+    exit $LASTEXITCODE
+}
 
 $ErrorActionPreference = "Stop"
 $RepoDir = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
