@@ -8,3 +8,5 @@ venv/
 logs/
 .env
 .pick.lock
+.daemon.lock
+radar_data/
